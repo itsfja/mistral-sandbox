@@ -64,6 +64,7 @@
 #   status    is the sandbox up? show CTID, state, IP
 #   shell     drop into a root shell inside the CT
 #   ip        print the current IP (empty if not running)
+#   export    bundle the keypair + ssh-config for desktop use (after 'up')
 #   hook      INTERNAL — called by the PVE hookscript shim with (vmid, phase)
 #
 # Optional: place a `provision.sh` beside this script — it runs INSIDE the
@@ -100,6 +101,7 @@ SANDBOX_TAG="${SANDBOX_TAG:-vibe-sandbox}"   # ownership tag; guard_ct() enforce
 HOOK_VOL_ID="local:snippets/vibe-sandbox-hook.sh"
 HOOK_SNIPPET_DIR="${HOOK_SNIPPET_DIR:-/var/lib/vz/snippets}"
 PROVISION_HOOK="$(dirname "$0")/provision.sh"
+EXPORT_DIR="${EXPORT_DIR:-/root/vibe-sandbox-export}"     # desktop bundle output dir
 LOCK_FILE="/run/lock/vibe-sandbox.lock"
 
 # --------------------------- helpers ---------------------------------------
@@ -370,6 +372,104 @@ cmd_purge() {
   echo "CT $CTID removed entirely (no stub left in the tree)."
 }
 
+# Desktop bundle: copy the managed keypair + an ssh-config snippet +
+# per-OS instructions, so the sandbox can be used from a desktop (Windows
+# or Linux) instead of the PVE console. The keypair is permanent, so one
+# export unlocks every future rebuild; only the embedded IP goes stale per
+# rebuild. Honest cost: the private key then also exists in $EXPORT_DIR and
+# on the desktop — delete the export dir after fetching the tarball.
+cmd_export() {
+  lock_or_die
+  [ "$EUID" -eq 0 ] || die "must run as root on the Proxmox host"
+  ct_running || die "sandbox not running; run 'up' first (export embeds the current IP)"
+  [ -n "$SSH_KEY_FILE" ] || die "export needs the managed keypair; SSH_PUBKEY-override keys live outside this script"
+  local ip mac hostip
+  ip="$(sandbox_ip)"
+  [ -n "$ip" ] || die "no IP for the sandbox (check ${BRIDGE}/DHCP)"
+  mac="$(pct config "$CTID" | awk -F'[,=]' '/^net0:/ {for (i=1;i<=NF;i++) if ($i=="hwaddr") print $(i+1)}')"
+  hostip="$(hostname -I | awk '{print $1}')"
+
+  mkdir -p "$EXPORT_DIR"
+  chmod 700 "$EXPORT_DIR"
+  cp "$SSH_KEY_FILE" "$EXPORT_DIR/vibe-sandbox"
+  cp "${SSH_KEY_FILE}.pub" "$EXPORT_DIR/vibe-sandbox.pub"
+  chmod 600 "$EXPORT_DIR/vibe-sandbox"
+  chmod 644 "$EXPORT_DIR/vibe-sandbox.pub"
+
+  cat > "$EXPORT_DIR/ssh-config" <<EOF
+# vibe-sandbox — append to ~/.ssh/config (Linux/macOS)
+# or %USERPROFILE%\.ssh\config (Windows). HostName goes stale after each
+# rebuild: re-run 'export' on the host, or edit the IP below.
+Host vibe-sandbox
+    HostName $ip
+    User root
+    IdentityFile ~/.ssh/vibe-sandbox
+EOF
+
+  cat > "$EXPORT_DIR/README.txt" <<EOF
+vibe-sandbox desktop bundle (exported $(date '+%Y-%m-%d %H:%M'), CT $CTID)
+======================================================================
+
+Use the sandbox from your desktop instead of the Proxmox console.
+
+Contents:
+  vibe-sandbox        private key (copy of the host-managed sandbox keypair)
+  vibe-sandbox.pub    public key
+  ssh-config          ssh config snippet -> 'ssh vibe-sandbox'
+  README.txt          this file
+
+The keypair is permanent: one export unlocks every future rebuild. Only
+the HostName (IP) goes stale after each rebuild — re-run 'export' on the
+host, or set a DHCP reservation for the sandbox MAC
+  ${mac:-unknown}
+to make the IP stable.
+
+Current sandbox IP: $ip
+
+Linux / macOS
+-------------
+  mkdir -p ~/.ssh && chmod 700 ~/.ssh
+  cp vibe-sandbox vibe-sandbox.pub ~/.ssh/
+  cat ssh-config >> ~/.ssh/config
+  ssh vibe-sandbox
+
+Windows 10+ (built-in OpenSSH; PowerShell or CMD)
+-------------------------------------------------
+  if not exist "%USERPROFILE%\.ssh" mkdir "%USERPROFILE%\.ssh"
+  copy vibe-sandbox "%USERPROFILE%\.ssh\vibe-sandbox"
+  copy vibe-sandbox.pub "%USERPROFILE%\.ssh\vibe-sandbox.pub"
+  type ssh-config >> "%USERPROFILE%\.ssh\config"
+  ssh vibe-sandbox
+
+  (no 'ssh' command? Settings > Apps > Optional features > OpenSSH Client,
+  then reopen the terminal)
+
+PuTTY instead of OpenSSH
+------------------------
+  puttygen "%USERPROFILE%\.ssh\vibe-sandbox" -o vibe-sandbox.ppk
+  Host Name: $ip   Port: 22   User: root
+  (load vibe-sandbox.ppk under Connection > SSH > Auth > Credentials)
+
+Security
+--------
+  The private key now also lives on this desktop. It is a dedicated
+  sandbox keypair — it unlocks the sandbox (every future rebuild too),
+  not the Proxmox host. After fetching the tarball, delete the host-side
+  copy so the key lives only on host and desktop:
+    rm -rf $EXPORT_DIR
+EOF
+
+  tar -czf "$EXPORT_DIR/vibe-sandbox-desktop.tar.gz" \
+      -C "$EXPORT_DIR" vibe-sandbox vibe-sandbox.pub ssh-config README.txt
+  chmod 600 "$EXPORT_DIR/vibe-sandbox-desktop.tar.gz"
+
+  echo "desktop bundle written to $EXPORT_DIR"
+  echo "  fetch from your desktop (host SSH must be reachable from your LAN):"
+  echo "    scp root@${hostip}:$EXPORT_DIR/vibe-sandbox-desktop.tar.gz ."
+  echo "  then follow the README.txt inside; connect with: ssh vibe-sandbox"
+  echo "note: re-run 'export' after each rebuild — only the IP changes; the key is permanent"
+}
+
 # INTERNAL: entry point for the PVE hookscript shim. PVE calls the shim with
 # (vmid, phase); the shim execs this. Phases:
 #   pre-start  — destroy + recreate fresh, stopped; PVE then boots the NEW CT
@@ -434,6 +534,7 @@ case "${1:-}" in
   status) shift; cmd_status ;;
   ip)     sandbox_ip ;;
   shell)  shift; cmd_shell ;;
+  export) shift; cmd_export ;;
   hook)   shift; cmd_hook "$@" ;;
   *) awk '/^set -/ {exit} /^#/ {print}' "$0"; exit 1 ;;
 esac
