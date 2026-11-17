@@ -48,6 +48,11 @@ outbound internet access — without handing it your machine.
   hostname. A same-ID collision — another system squatting on the CTID,
   by design or by operator error — aborts loudly instead of being
   destroyed. In the GUI, a refused check aborts the task: it fails closed.
+- **Self-updating** — the script is installed by hand, so local copies
+  drift; build paths (`up`, GUI Start) sha256-check against the copy on
+  `main`, auto-install the current version (previous copy kept beside
+  the script), and re-run once. `AUTO_UPDATE=off` disables; the `update`
+  subcommand does it on demand.
 
 ## Requirements
 
@@ -84,6 +89,12 @@ ls -l /root/vibe-sandbox.sh    # must show -rwx... (an x in the permissions)
 
 Prefer git? `git clone https://github.com/itsfja/mistral-sandbox.git`
 and use the script from the checkout; every later step is identical.
+
+The script also keeps itself current: every `up` (and every GUI Start)
+sha256-checks against the copy on `main` and self-updates if the local
+one is stale — the previous copy is kept at
+`/root/vibe-sandbox.sh.bak`. `AUTO_UPDATE=off` disables it; see
+[Self-update](#self-update).
 
 ### 2. Add your Mistral API key (one time)
 
@@ -347,6 +358,10 @@ with the refusal message in the task log rather than touching the CT.
 - GUI Start finishes but no ssh line in the task log — the post-start
   hook found no IP or provisioning failed; read the task log output
   above it, and the same checks as the `no IP` case apply.
+- `self-check: could not fetch/validate ...` (warning, build continues) —
+  the self-update check could not reach `RAW_URL` or the fetched file
+  failed `bash -n`; the build proceeds with the current script.
+  Harmless on an offline host; otherwise check `RAW_URL`.
 
 ## Subcommands
 
@@ -360,7 +375,43 @@ with the refusal message in the task log rather than touching the CT.
 | `ip` | print the current IP (empty if not running) |
 | `shell` | drop into a root shell inside the CT |
 | `export` | write a desktop bundle (keypair copy + ssh-config + per-OS instructions) to `EXPORT_DIR` |
+| `update` | self-update the script from `main` (previous copy kept beside it) |
 | `hook` | internal — called by the PVE hookscript shim with (vmid, phase) |
+
+## Self-update
+
+The script is installed by hand, so local copies drift: after a merged
+PR, the copy on your host keeps running the old code until you
+re-download it. So the script checks itself on every build path (`up`
+and GUI Start — the pre-start hook; `status`, `ip`, `shell`, and
+`down` stay instant and network-free):
+
+- **How**: sha256 of the running script vs the copy at `RAW_URL` (the
+  raw GitHub copy of this file on `main`). No version numbers to bump —
+  a different hash means stale.
+- **Stale**: the current copy is installed (it must pass `bash -n`
+  first), the previous copy is kept beside the script as
+  `vibe-sandbox.sh.bak`, the swap is an atomic `mv` (a concurrently
+  running instance keeps executing the old file undisturbed), and the
+  script re-execs itself once — so the build that noticed the drift
+  runs current code.
+- **Never blocks**: if the check cannot run (host offline, GitHub down,
+  timeout) or the fetched file fails `bash -n`, the script warns on
+  stderr and proceeds with the current copy. A stale script never
+  fails a build that would otherwise succeed.
+- **Controls**: `AUTO_UPDATE=off` disables the automatic check
+  entirely; `vibe-sandbox.sh update` performs the update explicitly
+  (same backup and validation), regardless of `AUTO_UPDATE`.
+
+Honest caveats:
+
+- This is code that runs as root, fetched over HTTPS from GitHub and
+  executed without further review — like the install one-liner in
+  step 1, but automatic. The trust boundary is this repo's `main`
+  branch: anyone who can push to it can change what runs on your host.
+- Hand-edited local copies are overwritten on the next build-path run
+  (your edits land in the `.bak`). Patch locally only with
+  `AUTO_UPDATE=off`.
 
 ## Credential store (rotation and revocation)
 
@@ -381,7 +432,9 @@ retained MAC lives), `CT_MAC` (pin a specific MAC instead of the managed
 one), `SECRETS_FILE`, `HOOK` (`on`/`off`: GUI lifecycle trapping),
 `CLOBBER` (`discard`/`zero`/`off`: post-stop rootfs wipe), `SANDBOX_TAG`
 (ownership tag enforced by the guard before any destroy or wipe),
-`EXPORT_DIR` (where the desktop bundle is written).
+`EXPORT_DIR` (where the desktop bundle is written),
+`AUTO_UPDATE` (`on`/`off`: build-path self-check against main), and
+`RAW_URL` (where the self-check fetches the current script from).
 
 ## Hooks
 

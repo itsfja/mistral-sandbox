@@ -60,6 +60,16 @@
 #                      instead of being destroyed. The guard fails closed:
 #                      in GUI hooks, a refused check aborts the task.
 #
+#   * SELF-UPDATING:    the script is installed by hand, so local copies
+#                      drift silently — a bug fixed on main keeps biting a
+#                      stale copy (that is how #10 went unnoticed). Build
+#                      paths (`up`, GUI pre-start) sha256-check against
+#                      main (RAW_URL): if stale, install the current copy
+#                      (backup at $0.bak, atomic mv) and re-exec ONCE, so
+#                      the build runs current code. The check degrades to
+#                      a warning when it cannot run. AUTO_UPDATE=off
+#                      disables; `update` does it explicitly.
+#
 # Run ON the Proxmox host as root (uses `pct` / `pveam` / `pvesm`).
 # Tested syntax: PVE 8.x. Review flags against your version before first run.
 #
@@ -72,6 +82,7 @@
 #   shell     drop into a root shell inside the CT
 #   ip        print the current IP (empty if not running)
 #   export    bundle the keypair + ssh-config for desktop use (after 'up')
+#   update    self-update the script from main (previous copy kept as .bak)
 #   hook      INTERNAL — called by the PVE hookscript shim with (vmid, phase)
 #
 # Optional: place a `provision.sh` beside this script — it runs INSIDE the
@@ -111,6 +122,8 @@ HOOK_VOL_ID="local:snippets/vibe-sandbox-hook.sh"
 HOOK_SNIPPET_DIR="${HOOK_SNIPPET_DIR:-/var/lib/vz/snippets}"
 PROVISION_HOOK="$(dirname "$0")/provision.sh"
 EXPORT_DIR="${EXPORT_DIR:-/root/vibe-sandbox-export}"     # desktop bundle output dir
+AUTO_UPDATE="${AUTO_UPDATE:-on}"        # on = build paths self-check against main; off = never check
+RAW_URL="${RAW_URL:-https://raw.githubusercontent.com/itsfja/mistral-sandbox/main/vibe-sandbox.sh}"
 LOCK_FILE="/run/lock/vibe-sandbox.lock"
 
 # --------------------------- helpers ---------------------------------------
@@ -119,6 +132,61 @@ die() { echo "error: $*" >&2; exit 1; }
 lock_or_die() {
   exec 9>"$LOCK_FILE"
   flock -n 9 || die "another vibe-sandbox operation is running (serial rebuild only)"
+}
+
+# Self-update: the script is installed by hand (curl one-liner), so local
+# copies drift silently — bugs fixed on main keep biting a stale host
+# copy (that is literally how #10 went undetected). Design:
+#   * build paths only (`up` and the GUI pre-start hook) self-check
+#     against main (RAW_URL) via a sha256 comparison; status/ip/shell
+#     stay instant and network-free.
+#   * stale -> install the current copy (bash -n validated, previous
+#     copy kept as $0.bak, atomic mv: a concurrently running instance
+#     keeps executing the old inode undisturbed) and re-exec ONCE
+#     (VIBE_SANDBOX_SELF_UPDATED guard), so the build that noticed the
+#     drift runs current code.
+#   * the check never blocks: an unreachable URL, a timeout, or a
+#     fetched file that fails bash -n all degrade to a warning and the
+#     current (old) script proceeds.
+#   * AUTO_UPDATE=off disables the automatic check entirely; the
+#     `update` subcommand performs the same install explicitly.
+#   * hand-edited local copies are overwritten on build paths (the
+#     edits land in the .bak); patch locally only with AUTO_UPDATE=off.
+
+fetch_current_script() {   # $1 = dest path, $2 = curl timeout (s)
+  curl -fsSL -m "${2:-15}" "$RAW_URL" > "$1" 2>/dev/null && bash -n "$1"
+}
+
+install_current_script() {   # $1 = temp file holding the new script; echoes backup path
+  local self new mode
+  self="$(readlink -f "$0")"
+  new="$1"
+  mode="$(stat -c %a "$self")"
+  cp -a "$self" "${self}.bak"
+  chmod "$mode" "$new"
+  mv -f "$new" "$self"
+  echo "${self}.bak"
+}
+
+self_check() {   # "$@" = full original argv; installs + re-execs once if stale
+  [ "$AUTO_UPDATE" = "on" ] || return 0
+  [ -z "${VIBE_SANDBOX_SELF_UPDATED:-}" ] || return 0
+  local tmp bak
+  tmp="$(mktemp 2>/dev/null)" || { echo "self-check: mktemp failed — skipping" >&2; return 0; }
+  if ! fetch_current_script "$tmp" 15; then
+    rm -f "$tmp"
+    echo "self-check: could not fetch/validate $RAW_URL — continuing with the current script" >&2
+    return 0
+  fi
+  if [ "$(sha256sum "$(readlink -f "$0")" | awk '{print $1}')" = "$(sha256sum "$tmp" | awk '{print $1}')" ]; then
+    rm -f "$tmp"
+    return 0
+  fi
+  bak="$(install_current_script "$tmp")"
+  echo "self-update: local script was stale — installed the current copy from main"
+  echo "  (previous copy: $bak); re-running on the new script"
+  export VIBE_SANDBOX_SELF_UPDATED=1
+  exec "$(readlink -f "$0")" "$@"
 }
 
 # Permanent, script-managed SSH keypair, retained on the HOST across
@@ -373,6 +441,7 @@ print_ssh_line() {
 
 # --------------------------- subcommands ------------------------------------
 cmd_up() {
+  self_check up
   lock_or_die
   # AUTO REBUILD: never resume — tear down any prior sandbox first
   destroy_sandbox
@@ -532,6 +601,7 @@ cmd_hook() {
   [ "$vmid" = "$CTID" ] || exit 0
   case "$phase" in
     pre-start)
+      self_check hook "$vmid" "$phase"
       lock_or_die
       echo "pre-start: rebuilding CT $CTID fresh"
       destroy_sandbox
@@ -574,6 +644,24 @@ cmd_shell() {
   pct enter "$CTID"
 }
 
+# Manual self-update: install main's copy explicitly. Works regardless of
+# AUTO_UPDATE; never re-execs. cmp against the current file first so a
+# no-op is quiet.
+cmd_update() {
+  [ "$EUID" -eq 0 ] || die "must run as root on the Proxmox host"
+  local self tmp bak
+  self="$(readlink -f "$0")"
+  tmp="$(mktemp)" || die "mktemp failed"
+  fetch_current_script "$tmp" 60 || die "could not fetch/validate $RAW_URL"
+  if cmp -s "$self" "$tmp"; then
+    rm -f "$tmp"
+    echo "script already current: $self"
+    return 0
+  fi
+  bak="$(install_current_script "$tmp")"
+  echo "updated $self from main (previous copy: $bak)"
+}
+
 # --------------------------- dispatch ---------------------------------------
 case "${1:-}" in
   up)     shift; cmd_up ;;
@@ -584,6 +672,7 @@ case "${1:-}" in
   ip)     sandbox_ip ;;
   shell)  shift; cmd_shell ;;
   export) shift; cmd_export ;;
+  update)  shift; cmd_update ;;
   hook)   shift; cmd_hook "$@" ;;
   *) awk '/^set -/ {exit} /^#/ {print}' "$0"; exit 1 ;;
 esac
