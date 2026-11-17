@@ -537,7 +537,7 @@ cmd_export() {
   ip="$(sandbox_ip)"
   [ -n "$ip" ] || die "no IP for the sandbox (check ${BRIDGE}/DHCP)"
   mac="$(pct config "$CTID" | awk -F'[,=]' '/^net0:/ {for (i=1;i<=NF;i++) if ($i=="hwaddr") print $(i+1)}')"
-  hostip="$(hostname -I | awk '{print $1}')"
+  hostip="${HOST_IP:-$(hostname -I | awk '{print $1}')}"
 
   mkdir -p "$EXPORT_DIR"
   chmod 700 "$EXPORT_DIR"
@@ -555,6 +555,11 @@ Host vibe-sandbox
     HostName $ip
     User root
     IdentityFile ~/.ssh/vibe-sandbox
+    # disposable sandbox: every rebuild mints a FRESH host key, so
+    # strict known-hosts checking would block the 2nd+ rebuild connect.
+    # Scoped to this Host alias only — never copy it to other hosts.
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
 EOF
 
   cat > "$EXPORT_DIR/README.txt" <<EOF
@@ -602,11 +607,23 @@ Windows 10+ (built-in OpenSSH; PowerShell or CMD)
   (no 'ssh' command? Settings > Apps > Optional features > OpenSSH Client,
   then reopen the terminal)
 
+REBUILDS AND HOST KEYS
+----------------------
+  Every rebuild mints a fresh SSH host key for the sandbox. The bundled
+  ssh-config pins StrictHostKeyChecking no + UserKnownHostsFile /dev/null
+  for this one Host, so 'ssh vibe-sandbox' just works after every rebuild.
+  (Windows OpenSSH maps /dev/null to NUL; if your ssh rejects the line,
+  write NUL there instead.) With a hand-rolled config, expect REMOTE HOST
+  IDENTIFICATION HAS CHANGED after each rebuild — expected rotation,
+  not an attack; recover and reconnect:
+    ssh-keygen -R $ip
+
 PuTTY instead of OpenSSH
 ------------------------
   puttygen "%USERPROFILE%\.ssh\vibe-sandbox" -o vibe-sandbox.ppk
   Host Name: $ip   Port: 22   User: root
   (load vibe-sandbox.ppk under Connection > SSH > Auth > Credentials)
+  (each rebuild mints a fresh host key — accept it when PuTTY asks)
 
 Security
 --------
@@ -624,10 +641,17 @@ EOF
   echo "desktop bundle written to $EXPORT_DIR"
   echo "  fetch from your desktop (host SSH must be reachable from your LAN):"
   echo "    scp root@${hostip}:$EXPORT_DIR/vibe-sandbox-desktop.tar.gz ."
+  if [ "$(hostname -I | wc -w)" -gt 1 ]; then
+    echo "  note: this host is multi-homed ($(hostname -I | awk '{$1=$1};1')) —"
+    echo "  if $hostip is not reachable from your desktop, rerun with:"
+    echo "    HOST_IP=<reachable-address> $0 export"
+  fi
   echo "  then follow the README.txt inside; connect with: ssh vibe-sandbox"
   echo "recommended: set a DHCP reservation for the sandbox MAC ${mac:-unknown} —"
   echo "  it is retained across rebuilds, so the IP stays stable forever"
   echo "note: without a reservation, re-run 'export' after each rebuild — only the IP changes; the key is permanent"
+  echo "note: rebuilds mint a fresh host key; the bundled ssh-config pins"
+  echo "  StrictHostKeyChecking no for the sandbox Host, so desktop connects survive rebuilds"
 }
 
 # INTERNAL: entry point for the PVE hookscript shim. PVE calls the shim with
