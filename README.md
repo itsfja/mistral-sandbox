@@ -285,6 +285,14 @@ flowchart TD
 | Restart | stop phases, then start phases: a fresh rebuild |
 | Snapshot / Clone / Migrate / Backup / Console | **not trappable** (no hook phase) — harmless, since the next Start purges everything, but they cannot be blocked per-CT |
 
+CLI and hooks coexist: a hook phase fires from *inside* the `pct` call
+that triggered it. When `up` or `down` triggers one (`up` starts the CT,
+`down` stops it), that CLI operation already holds the serial lock and
+does the phase's work itself — the hook passes through with a one-line
+notice. When the GUI triggers the phase, the hook takes the lock and
+does the work. A hook phase therefore never aborts a CLI build with
+"another operation is running"; it only ever guards the CT.
+
 Honest caveats:
 
 - **Test on your PVE build first.** The pre-start hook recreates the CT
@@ -336,6 +344,12 @@ with the refusal message in the task log rather than touching the CT.
 - `another vibe-sandbox operation is running` — a build is in progress;
   the script refuses to run two at a time by design. Wait for it to
   finish (or check `ps aux | grep vibe-sandbox`).
+- `hookscript error ... on pre-start` at the end of a CLI `up`, right
+  after the CT is created — a script from before the hook-lock fix:
+  the pre-start hook demanded the serial lock while `up` itself held
+  it, aborting the very start it was part of. Update the script
+  (`update` subcommand, or the step-1 `curl` one-liner) and re-run
+  `up`: the half-built CT is destroyed first and the rebuild proceeds.
 - `clobber: blkdiscard failed` — your rootfs sits on rotational storage;
   use `CLOBBER=zero` for overwrite-grade wiping.
 - `refusing to touch CT <id>: it is not this script's sandbox` — the
