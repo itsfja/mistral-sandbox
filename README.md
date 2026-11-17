@@ -37,6 +37,11 @@ outbound internet access — without handing it your machine.
   CT is replaced by a pristine, unprovisioned stopped stub: the GUI keeps a
   Start-able object while the stopped sandbox holds nothing from the
   previous session. `CLOBBER=off` skips the wipe.
+- **Ownership-guarded** — every destroy or clobber first verifies the CT
+  carries this script's ownership tag (`vibe-sandbox`) and the sandbox
+  hostname. A same-ID collision — another system squatting on the CTID,
+  by design or by operator error — aborts loudly instead of being
+  destroyed. In the GUI, a refused check aborts the task: it fails closed.
 
 ## Requirements
 
@@ -154,10 +159,10 @@ the Proxmox GUI becomes the front end:
 
 ```mermaid
 flowchart TD
-    S["GUI: right-click Start"] --> PS1["pre-start hook:<br/>destroy + recreate fresh"]
+    S["GUI: right-click Start"] --> PS1["pre-start hook:<br/>guard + destroy + recreate fresh"]
     PS1 --> PVEB["PVE boots the NEW container"]
     PVEB --> PS2["post-start hook:<br/>provision + inject credentials<br/>ssh line goes to the task log"]
-    T["GUI: right-click Stop / Shutdown"] --> PR2["post-stop hook:<br/>clobber rootfs + park fresh stub"]
+    T["GUI: right-click Stop / Shutdown"] --> PR2["post-stop hook:<br/>guard + clobber rootfs + park fresh stub"]
     R["GUI: right-click Restart"] --> PR2
     PR2 --> S
 ```
@@ -183,6 +188,26 @@ Honest caveats:
   VG with LUKS, and rely on the sandbox's dedicated, instantly revocable
   API key.
 
+## Ownership guard
+
+The script destroys and wipes a fixed CTID on every rebuild, so it refuses
+to touch any CT it cannot prove it owns. Ownership = the CT carries both
+the sandbox hostname (`vibe-sandbox`) and the ownership tag
+(`vibe-sandbox`, both overridable) on its config:
+
+- **Created by this script** — the tag is set automatically at `pct create`;
+  nothing to do.
+- **Legacy sandbox from an older script version** (no tag) — recognized and
+  auto-tagged, but only if it also carries the managed hookscript.
+- **Anything else at that ID** — your wordpress CT, someone's test box, a
+  mis-set `CTID` — every `up`, `down`, `purge`, and GUI hook aborts with
+  `refusing to touch CT <id>` and states what to do: move the CT or pick
+  another `CTID`. Tag it manually only if you are certain it is an old
+  sandbox: `pct set <id> --tags vibe-sandbox`.
+
+The guard fails closed: in the GUI, a refused Start or Stop aborts the task
+with the refusal message in the task log rather than touching the CT.
+
 ## Troubleshooting
 
 - `no debian-12 template found; set TEMPLATE manually` — the host's
@@ -201,6 +226,11 @@ Honest caveats:
   finish (or check `ps aux | grep vibe-sandbox`).
 - `clobber: blkdiscard failed` — your rootfs sits on rotational storage;
   use `CLOBBER=zero` for overwrite-grade wiping.
+- `refusing to touch CT <id>: it is not this script's sandbox` — the
+  ownership guard fired: something that is not a tagged, sandbox-hostnamed
+  CT sits at that ID. Move it or set `CTID` to a free ID; only if you are
+  certain it is an old sandbox, tag it manually:
+  `pct set <id> --tags vibe-sandbox`.
 - GUI Start finishes but no ssh line in the task log — the post-start
   hook found no IP or provisioning failed; read the task log output
   above it, and the same checks as the `no IP` case apply.
@@ -234,7 +264,8 @@ All overridable by environment variables: `CTID`, `CTHOST`, `CORES`,
 `SSH_PUBKEY` (use an existing key instead of the managed one),
 `SSH_KEY_FILE` (where the managed keypair lives), `SECRETS_FILE`,
 `HOOK` (`on`/`off`: GUI lifecycle trapping), `CLOBBER`
-(`discard`/`zero`/`off`: post-stop rootfs wipe).
+(`discard`/`zero`/`off`: post-stop rootfs wipe), `SANDBOX_TAG`
+(ownership tag enforced by the guard before any destroy or wipe).
 
 ## Hooks
 
@@ -262,3 +293,6 @@ hookscript — this one is your per-use provisioning hook.)
 - Clobber protects the stopped CT's disk only. For physical-theft threat
   models, LUKS-encrypt the PVE host and keep the sandbox API key dedicated
   and instantly revocable.
+- Destructive operations are ownership-guarded: the script refuses to
+  destroy or wipe any CT that does not carry its tag and hostname, and
+  the guard fails closed in GUI hooks.
