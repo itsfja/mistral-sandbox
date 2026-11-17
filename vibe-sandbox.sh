@@ -419,7 +419,7 @@ cmd_export() {
   local ip mac hostip
   ip="$(sandbox_ip)"
   [ -n "$ip" ] || die "no IP for the sandbox (check ${BRIDGE}/DHCP)"
-  mac="$(pct config "$CTID" | awk -F'[,=]' '/^net0:/ {for (i=1;i<=NF;i++) if ($i==\"hwaddr\") print $(i+1)}')"
+  mac="$(pct config "$CTID" | awk -F'[,=]' '/^net0:/ {for (i=1;i<=NF;i++) if ($i=="hwaddr") print $(i+1)}')"
   hostip="$(hostname -I | awk '{print $1}')"
 
   mkdir -p "$EXPORT_DIR"
