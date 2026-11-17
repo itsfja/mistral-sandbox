@@ -178,8 +178,14 @@ template_auto() {
   t="$(pveam available --section system 2>/dev/null \
        | awk '/debian-12-standard/ {print $2}' | tail -n1)"
   [ -n "$t" ] || die "no debian-12 template found; set TEMPLATE manually"
-  # download if not already present
-  pveam list local 2>/dev/null | grep -q "${t##*/}" || pveam download local "$t"
+  # download if not already present. The >&2 is load-bearing: this function
+  # is consumed via TEMPLATE="$(template_auto)", and pveam download prints
+  # its whole verbose progress (downloading/wget/checksum) to stdout —
+  # without the redirect that log is captured into TEMPLATE and pct create
+  # rejects the oversized ostemplate ("value may only be 255 characters
+  # long"). stderr passes through $(...) to the terminal, so the progress
+  # stays visible live.
+  pveam list local 2>/dev/null | grep -q "${t##*/}" || pveam download local "$t" >&2
   echo "local:vztmpl/${t##*/}"
 }
 
@@ -419,7 +425,7 @@ cmd_export() {
   local ip mac hostip
   ip="$(sandbox_ip)"
   [ -n "$ip" ] || die "no IP for the sandbox (check ${BRIDGE}/DHCP)"
-  mac="$(pct config "$CTID" | awk -F'[,=]' '/^net0:/ {for (i=1;i<=NF;i++) if ($i=="hwaddr") print $(i+1)}')"
+  mac="$(pct config "$CTID" | awk -F'[,=]' '/^net0:/ {for (i=1;i<=NF;i++) if ($i==\"hwaddr\") print $(i+1)}')"
   hostip="$(hostname -I | awk '{print $1}')"
 
   mkdir -p "$EXPORT_DIR"
