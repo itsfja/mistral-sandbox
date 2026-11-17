@@ -28,14 +28,20 @@ outbound internet access — without handing it your machine.
   first `up`, and its public half is injected into every rebuild. The
   private key stays on the host; override with `SSH_PUBKEY` to reuse an
   existing key instead.
+- **MAC-kept** — the sandbox's MAC address is generated once and retained
+  on the host (default `/root/.vibe-sandbox.mac`), then pinned on every
+  rebuild — PVE would otherwise mint a fresh random MAC each time, silently
+  breaking DHCP reservations. Fix the sandbox IP by reserving it on your
+  DHCP server for that MAC: the reservation then holds for every future
+  rebuild. Override with `CT_MAC`.
 - **GUI-trapped** — the Proxmox GUI drives the lifecycle: right-click
   Start = fresh rebuild + provisioning; Stop = disk clobber + parked stub;
   Restart = fresh rebuild. Implemented with a `pct` hookscript, whose shim
   is auto-deployed on every run. `HOOK=off` disables it.
 - **Clobbered** — on stop, the rootfs is discarded (`CLOBBER=discard`,
   instant on SSD) or zero-filled (`CLOBBER=zero`, overwrite-grade) and the
-  CT is replaced by a pristine, unprovisioned stopped stub: the GUI keeps a
-  Start-able object while the stopped sandbox holds nothing from the
+  CT is replaced by a pristine, unprovisioned stopped stub: the GUI keeps
+  a Start-able object while the stopped sandbox holds nothing from the
   previous session. `CLOBBER=off` skips the wipe.
 - **Ownership-guarded** — every destroy or clobber first verifies the CT
   carries this script's ownership tag (`vibe-sandbox`) and the sandbox
@@ -172,6 +178,9 @@ vibe --version    # the CLI is installed
 vibe              # start a session; /whoami shows which credentials are in use
 ```
 
+Or work from your desktop instead of the host: see
+[From your desktop (export)](#from-your-desktop-export) below.
+
 ### 6. When you are done
 
 ```bash
@@ -183,6 +192,65 @@ nothing from your session is recoverable from it. Your API key store and
 SSH keypair stay on the host. The next session is either `up` again, or
 just right-click Start on the stub in the Proxmox GUI. To remove the CT
 from the tree entirely, use `purge` instead.
+
+## From your desktop (export)
+
+Only the build (`up`) and teardown (`down`) have to run on the PVE
+console; your day-to-day ssh sessions can run from your desktop. After
+`up`:
+
+```bash
+/root/vibe-sandbox.sh export
+```
+
+writes a desktop bundle to `/root/vibe-sandbox-export` (overridable:
+`EXPORT_DIR`): a copy of the sandbox keypair, an `ssh-config` snippet
+(`ssh vibe-sandbox`), and a README.txt with per-OS instructions
+(Linux/macOS, Windows built-in OpenSSH, and a PuTTY `.ppk` conversion).
+It prints the `scp` command to fetch the tarball from your desktop
+(host SSH must be reachable from your LAN), then:
+
+```text
+mkdir -p ~/.ssh && chmod 700 ~/.ssh          # Linux/macOS
+cp vibe-sandbox vibe-sandbox.pub ~/.ssh/
+cat ssh-config >> ~/.ssh/config
+ssh vibe-sandbox
+```
+
+### Fix the IP on your DHCP server (recommended)
+
+The sandbox gets its address over DHCP, so the IP can change on every
+rebuild — but the **MAC address is permanent**: the script retains it on
+the host (default `/root/.vibe-sandbox.mac`, like the keypair) and pins it
+on every rebuild. So fix the IP once on whatever hands out addresses
+(router, pfSense/OPNsense, Pi-hole, Windows DHCP...): create a DHCP
+reservation for the sandbox MAC, and the same IP comes back for every
+future rebuild — `ssh vibe-sandbox` then works forever without touching
+your ssh config again.
+
+Find the MAC with any of:
+
+```bash
+pct config 1042 | grep net0        # hwaddr=... on the host
+cat /root/.vibe-sandbox.mac        # the retained MAC store
+```
+
+`export` also prints it and lists it in the bundle README.txt.
+
+Notes:
+
+- **The keypair is permanent**: one export unlocks every future rebuild.
+  Only the IP embedded in `ssh-config` can go stale after each rebuild —
+  re-run `export`, or avoid it entirely with the DHCP reservation above
+  (the MAC it binds is retained across rebuilds, so the reservation holds
+  forever).
+- `export` requires a running sandbox (it embeds the current IP) and the
+  managed keypair; with an `SSH_PUBKEY` override, export your own key
+  yourself — the script will not copy keys it does not manage.
+- Honest cost: the private key then also exists in the host's export dir
+  and on your desktop. That is the point of the feature, but it means the
+  key no longer lives only on the host — delete the export dir after
+  fetching the tarball (the bundle README says how).
 
 ## GUI-driven lifecycle (Proxmox right-click)
 
@@ -264,6 +332,12 @@ with the refusal message in the task log rather than touching the CT.
   CT sits at that ID. Move it or set `CTID` to a free ID; only if you are
   certain it is an old sandbox, tag it manually:
   `pct set <id> --tags vibe-sandbox`.
+- `ssh vibe-sandbox` connects to nothing after a rebuild — the IP in your
+  ssh config went stale (DHCP). Re-run `export` on the host and re-fetch,
+  or edit the `HostName` line in your ssh config; the key itself is still
+  valid, so only the IP needs changing. To make it permanent, set a DHCP
+  reservation for the sandbox MAC (retained across rebuilds): see
+  [Fix the IP on your DHCP server](#fix-the-ip-on-your-dhcp-server-recommended).
 - GUI Start finishes but no ssh line in the task log — the post-start
   hook found no IP or provisioning failed; read the task log output
   above it, and the same checks as the `no IP` case apply.
@@ -279,6 +353,7 @@ with the refusal message in the task log rather than touching the CT.
 | `status` | is the sandbox up? CTID, state, IP |
 | `ip` | print the current IP (empty if not running) |
 | `shell` | drop into a root shell inside the CT |
+| `export` | write a desktop bundle (keypair copy + ssh-config + per-OS instructions) to `EXPORT_DIR` |
 | `hook` | internal — called by the PVE hookscript shim with (vmid, phase) |
 
 ## Credential store (rotation and revocation)
@@ -295,10 +370,12 @@ Mistral usage.
 All overridable by environment variables: `CTID`, `CTHOST`, `CORES`,
 `RAM_MB`, `SWAP_MB`, `DISK_GB`, `STORAGE`, `BRIDGE`, `TEMPLATE`,
 `SSH_PUBKEY` (use an existing key instead of the managed one),
-`SSH_KEY_FILE` (where the managed keypair lives), `SECRETS_FILE`,
-`HOOK` (`on`/`off`: GUI lifecycle trapping), `CLOBBER`
-(`discard`/`zero`/`off`: post-stop rootfs wipe), `SANDBOX_TAG`
-(ownership tag enforced by the guard before any destroy or wipe).
+`SSH_KEY_FILE` (where the managed keypair lives), `MAC_FILE` (where the
+retained MAC lives), `CT_MAC` (pin a specific MAC instead of the managed
+one), `SECRETS_FILE`, `HOOK` (`on`/`off`: GUI lifecycle trapping),
+`CLOBBER` (`discard`/`zero`/`off`: post-stop rootfs wipe), `SANDBOX_TAG`
+(ownership tag enforced by the guard before any destroy or wipe),
+`EXPORT_DIR` (where the desktop bundle is written).
 
 ## Hooks
 
@@ -319,7 +396,9 @@ hookscript — this one is your per-use provisioning hook.)
 
 - No credentials are stored in this repository (see `.gitignore`); the API
   key and the sandbox SSH private key live only on the host (key store and
-  `/root/.vibe-sandbox-ssh`) and inside the ephemeral container.
+  `/root/.vibe-sandbox-ssh`) and inside the ephemeral container — until
+  you run `export`, after which a copy of the private key also exists on
+  your desktop (and in the host's export dir until you delete it).
 - The container is unprivileged with nesting enabled.
 - Treat the sandbox like a CI job: least-privileged, revocable credentials
   only.
