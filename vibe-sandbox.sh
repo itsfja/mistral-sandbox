@@ -134,6 +134,25 @@ lock_or_die() {
   flock -n 9 || die "another vibe-sandbox operation is running (serial rebuild only)"
 }
 
+# Hook phases fire from INSIDE the pct call of the operation that already
+# holds the serial lock: `up` runs `pct create --start` (pre-start and
+# post-start fire under up's lock), `down`/`purge` run `pct stop`
+# (post-stop fires under theirs), a GUI Start/Stop runs under nobody's.
+# A hook phase must therefore never DEMAND the lock (lock_or_die) — when
+# `up` builds, the pre-start hook would abort the very start it is part
+# of. Instead: lock free = standalone/GUI task, take it and do the
+# phase's work; lock held = the holder IS the operation whose pct call
+# triggered this hook and it does that work itself — pass through
+# quietly with exit 0.
+hook_lock() {   # $1 = phase; rc 0 = lock acquired (do the work), rc 1 = passthrough
+  exec 9>"$LOCK_FILE"
+  if flock -n 9; then
+    return 0
+  fi
+  echo "vibe-sandbox: operation in progress — $1 hook passthrough" >&2
+  return 1
+}
+
 # Self-update: the script is installed by hand (curl one-liner), so local
 # copies drift silently — bugs fixed on main keep biting a stale host
 # copy (that is literally how #10 went undetected). Design:
@@ -596,13 +615,18 @@ EOF
 #   post-stop  — clobber + park stub
 # All destructive phases go through guard_ct(): if the CT at $CTID is not
 # provably ours, the hook ABORTS the GUI task instead of touching it.
+# Hook phases lock with hook_lock(), never lock_or_die: a phase can fire
+# from inside `up`'s or `down`'s own pct call, which already holds the
+# serial lock. Lock free -> standalone/GUI task, this hook does the
+# phase's work; lock held -> the holder is the triggering operation and
+# does the work itself, this hook passes through with exit 0.
 cmd_hook() {
   local vmid="${1:-}" phase="${2:-}"
   [ "$vmid" = "$CTID" ] || exit 0
   case "$phase" in
     pre-start)
       self_check hook "$vmid" "$phase"
-      lock_or_die
+      hook_lock "$phase" || exit 0
       echo "pre-start: rebuilding CT $CTID fresh"
       destroy_sandbox
       ensure_ssh_key
@@ -611,7 +635,7 @@ cmd_hook() {
       create_sandbox stopped
       ;;  # PVE now starts the newly created CT
     post-start)
-      lock_or_die
+      hook_lock "$phase" || exit 0
       local ip
       ip="$(wait_for_ip)" || { echo "post-start: no IP (check ${BRIDGE}/DHCP)"; exit 0; }
       provision_and_report
@@ -621,7 +645,7 @@ cmd_hook() {
     pre-stop)
       : ;;
     post-stop)
-      lock_or_die
+      hook_lock "$phase" || exit 0
       park_sandbox
       echo "post-stop: sandbox clobbered and parked as a fresh stub (CT $CTID)"
       ;;
