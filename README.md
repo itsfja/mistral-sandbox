@@ -100,12 +100,44 @@ chats, or screenshots. If you skip this step entirely, builds still work,
 but the first `vibe` launch inside the sandbox will fall back to an
 interactive sign-in.
 
-### 3. Check two host settings (two minutes)
+### 3. Check three host settings (two minutes)
 
 ```bash
 pct list       # CT 1042 must not already exist; if it does, pick another: CTID=1043
 pvesm status   # find your rootfs storage name; default expected: local-lvm
+ip -br link show type bridge    # list the bridges that exist; default expected: vmbr0
 ```
+
+Then confirm the bridge actually carries working networking. Best signal:
+what your existing CTs already use (each line shows
+`<file>: net0: ...bridge=<name>...`):
+
+```bash
+grep -H net0 /etc/pve/lxc/*.conf 2>/dev/null || echo "no existing CTs — use the DHCP probe below"
+```
+
+That check only means something if you already have CTs. On a fresh node
+with none, or if the grep printed nothing:
+
+- Bridges are rebuilt from `/etc/network/interfaces` at boot, so check
+  what PVE is configured to create there:
+  `grep -E '^iface|bridge-ports' /etc/network/interfaces`.
+- Probe the candidate bridge for a DHCP server without creating any CT:
+
+  ```bash
+  timeout 60 dhclient -1 -d -sf /bin/true -lf /dev/null -pf /tmp/dhcptest.pid vmbr0 \
+    && echo "DHCP reachable on vmbr0" || echo "no DHCP answer on vmbr0"
+  ```
+
+  One real DHCPDISCOVER is sent (a DHCP server may briefly hold the lease
+  it offers), but the offered address is never applied (`-sf /bin/true`)
+  and the probe exits on its own. If `dhclient` is not installed:
+  `apt install isc-dhcp-client`. A timeout here predicts the
+  `no IP` build failure later — fix DHCP on that network first.
+- Or skip the probe entirely: run `up` and treat its
+  `container started but no IP` error as the check. That failure is
+  benign — remove the half-built CT with `purge`, fix the bridge/DHCP,
+  and run `up` again.
 
 If your storage or network bridge differ from the defaults, pass them on
 the command line (with every command you run):
@@ -216,7 +248,8 @@ with the refusal message in the task log rather than touching the CT.
   `pveam download local <name>`; or set `TEMPLATE=local:vztmpl/<name>`.
 - `container started but no IP (check vmbr0/DHCP)` — the bridge has no
   DHCP server handing out addresses. Fix DHCP on that network, or create
-  a bridge that has one, and pass `BRIDGE=<name>`.
+  a bridge that has one, and pass `BRIDGE=<name>`. The step-3 DHCP probe
+  can confirm this before you build again.
 - `must run as root` or `permission denied` — you are not root. `sudo -i`
   first; every command in Quick start assumes root.
 - `curl` failed to download the script — check the host's internet:
