@@ -421,6 +421,15 @@ curl -LsSf https://mistral.ai/vibe/install.sh | bash
 ln -sf /root/.local/bin/vibe     /usr/local/bin/vibe     2>/dev/null || true
 ln -sf /root/.local/bin/vibe-acp /usr/local/bin/vibe-acp 2>/dev/null || true
 
+# root access is by the injected keypair ONLY: the template ships root's
+# password locked and the script never sets one; pin key-only root login
+# explicitly (the Debian default, made unconditional here) so a template
+# change can never quietly enable password auth. Needs the template's
+# Include of sshd_config.d (Debian ships it).
+mkdir -p /etc/ssh/sshd_config.d
+printf 'PermitRootLogin prohibit-password\n' > /etc/ssh/sshd_config.d/10-vibe-root-key-only.conf
+sshd -t && systemctl reload ssh >/dev/null 2>&1 || true
+
 vibe --version
 EOF
 }
