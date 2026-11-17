@@ -45,6 +45,13 @@
 #                      same CTID — so the GUI keeps a Start-able object
 #                      while the stopped sandbox holds nothing from the
 #                      previous session. CLOBBER=off skips the wipe.
+#   * GUARDED:          every destroy/clobber passes guard_ct(): the CT must
+#                      carry this script's ownership tag (SANDBOX_TAG,
+#                      default 'vibe-sandbox') AND the sandbox hostname.
+#                      A same-ID collision — another system squatting on
+#                      $CTID by design or by operator error — aborts loudly
+#                      instead of being destroyed. The guard fails closed:
+#                      in GUI hooks, a refused check aborts the task.
 #
 # Run ON the Proxmox host as root (uses `pct` / `pveam` / `pvesm`).
 # Tested syntax: PVE 8.x. Review flags against your version before first run.
@@ -89,6 +96,7 @@ SSH_KEY_FILE="${SSH_KEY_FILE:-/root/.vibe-sandbox-ssh}"   # host-side keypair (p
 SECRETS_FILE="${SECRETS_FILE:-/root/.vibe-sandbox.env}"   # host-side key store
 HOOK="${HOOK:-on}"                    # on = attach PVE hookscript (GUI trap)
 CLOBBER="${CLOBBER:-discard}"         # discard | zero | off — post-stop rootfs wipe
+SANDBOX_TAG="${SANDBOX_TAG:-vibe-sandbox}"   # ownership tag; guard_ct() enforces it
 HOOK_VOL_ID="local:snippets/vibe-sandbox-hook.sh"
 HOOK_SNIPPET_DIR="${HOOK_SNIPPET_DIR:-/var/lib/vz/snippets}"
 PROVISION_HOOK="$(dirname "$0")/provision.sh"
@@ -161,7 +169,32 @@ wait_for_ip() {
   return 1
 }
 
+# Ownership interlock: EVERY destructive operation must pass this gate.
+# The sandbox is identified by BOTH the sandbox hostname AND the ownership
+# tag on the CT config. A same-ID collision — some other system squatting
+# on $CTID by design or by operator error — aborts loudly instead of being
+# destroyed. Pre-tagging sandboxes are recognized (and healed) only when
+# they also carry this script's managed hookscript.
+guard_ct() {
+  ct_exists || return 0
+  local cfg hostname tags
+  cfg="$(pct config "$CTID")"
+  hostname="$(echo "$cfg" | awk '/^hostname:/ {print $2}')"
+  tags="$(echo "$cfg" | awk '/^tags:/ {print $2}')"
+  if [ "$hostname" = "$CTHOST" ] && echo "$tags" | grep -qw "$SANDBOX_TAG"; then
+    return 0
+  fi
+  # legacy sandbox from before tagging: our hostname AND our hookscript
+  if [ "$hostname" = "$CTHOST" ] && echo "$cfg" | grep -q "^hookscript: ${HOOK_VOL_ID}$"; then
+    echo "guard: untagged legacy sandbox found — tagging CT $CTID as '$SANDBOX_TAG'"
+    pct set "$CTID" --tags "${tags:+${tags};}${SANDBOX_TAG}"
+    return 0
+  fi
+  die "refusing to touch CT $CTID: it is not this script's sandbox (hostname '$hostname', tags '${tags:-none}'; expected hostname '$CTHOST' with tag '$SANDBOX_TAG'). If that CT is something else, move it or set CTID to a free ID; only if you are CERTAIN it is an old sandbox, tag it manually: pct set $CTID --tags $SANDBOX_TAG"
+}
+
 destroy_sandbox() {
+  guard_ct   # ownership interlock: never destroy a CT that is not ours
   if ct_exists; then
     ct_running && pct stop "$CTID"
     pct destroy "$CTID" --purge
@@ -171,6 +204,7 @@ destroy_sandbox() {
 
 # Create the sandbox CT. $1 = start | stopped. The hookscript is attached
 # whenever HOOK=on so the GUI trap works on every incarnation, stub included.
+# The ownership tag is set here; guard_ct() enforces it before any destroy.
 create_sandbox() {
   local hookargs=() startargs=()
   [ "$HOOK" = "on" ] && hookargs=(--hookscript "$HOOK_VOL_ID")
@@ -183,6 +217,7 @@ create_sandbox() {
     --unprivileged 1 \
     --features nesting=1 \
     --ssh-public-keys "$SSH_PUBKEY" \
+    --tags "$SANDBOX_TAG" \
     --onboot 0 \
     "${hookargs[@]}" \
     "${startargs[@]}"
@@ -191,6 +226,7 @@ create_sandbox() {
 # Wipe the rootfs of the STOPPED CT (keep the disk object, destroy the data).
 clobber_disk() {
   [ "$CLOBBER" = "off" ] && return 0
+  guard_ct   # ownership interlock: never wipe a CT that is not ours
   local line volid dev
   line="$(pct config "$CTID" 2>/dev/null | awk '/^rootfs:/')" || true
   volid="$(echo "$line" | cut -d' ' -f2 | cut -d, -f1)"
@@ -340,6 +376,8 @@ cmd_purge() {
 #   post-start — wait for IP, provision, log the ssh line
 #   pre-stop   — no-op (PVE handles the stop)
 #   post-stop  — clobber + park stub
+# All destructive phases go through guard_ct(): if the CT at $CTID is not
+# provably ours, the hook ABORTS the GUI task instead of touching it.
 cmd_hook() {
   local vmid="${1:-}" phase="${2:-}"
   [ "$vmid" = "$CTID" ] || exit 0
