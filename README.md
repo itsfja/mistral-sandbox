@@ -192,6 +192,15 @@ vibe              # start a session; /whoami shows which credentials are in use
 Or work from your desktop instead of the host: see
 [From your desktop (export)](#from-your-desktop-export) below.
 
+Other doors in and out:
+
+- `/root/vibe-sandbox.sh shell` — run on the **host**, it drops into a
+  root shell in the CT (`pct enter`, no password).
+- The Proxmox GUI **console** is the one door that never opens: the
+  sandbox has no root password (root ships locked, the script never
+  sets one, and root SSH is key-only), so the console login prompt
+  refuses everything, by design. Use ssh or `shell`.
+
 ### 6. When you are done
 
 ```bash
@@ -238,6 +247,17 @@ on every rebuild. So fix the IP once on whatever hands out addresses
 reservation for the sandbox MAC, and the same IP comes back for every
 future rebuild — `ssh vibe-sandbox` then works forever without touching
 your ssh config again.
+
+The retained MAC is **locally administered** (`02:...`, the
+locally-administered bit set — deliberate, so it never squats on a
+real vendor OUI). Some routers flag such MACs with a
+"private MAC"/"unknown manufacturer" warning on the device; that is
+cosmetic — the MAC is stable and pinned on every rebuild, so the
+reservation holds. If your router genuinely objects, pin a
+universally-administered MAC instead: overwrite the retained store
+(`printf 'xx:xx:xx:xx:xx:xx\n' > /root/.vibe-sandbox.mac`, durable —
+every later command uses it), or pass `CT_MAC=xx:xx:xx:xx:xx:xx` per
+command.
 
 Find the MAC with any of:
 
@@ -383,6 +403,23 @@ with the refusal message in the task log rather than touching the CT.
   the self-update check could not reach `RAW_URL` or the fetched file
   failed `bash -n`; the build proceeds with the current script.
   Harmless on an offline host; otherwise check `RAW_URL`.
+- GUI console / `pct console` refuses every login (`Login incorrect`) —
+  by design: the sandbox has no root password (root ships locked; the
+  script never sets one) and root SSH is key-only. Use
+  `ssh -i /root/.vibe-sandbox-ssh root@<ip>` (note the leading dot), or
+  run `/root/vibe-sandbox.sh shell` on the host (`pct enter`, no
+  password).
+- `ssh` says `Identity file ... not accessible` or the shell says
+  `vibe-sandbox.sh: command not found` — the key lives at
+  `/root/.vibe-sandbox-ssh` (leading dot) and the script is not on
+  PATH: use full paths —
+  `ssh -i /root/.vibe-sandbox-ssh root@$(/root/vibe-sandbox.sh ip)`.
+- Router flags the sandbox device with a "private MAC" warning — the
+  retained MAC is locally administered (`02:...`) by design; stable
+  across rebuilds, so DHCP reservations hold. To silence it, pin a
+  universally-administered MAC:
+  `printf 'xx:xx:xx:xx:xx:xx\n' > /root/.vibe-sandbox.mac` (or
+  `CT_MAC=...` per command).
 
 ## Subcommands
 
@@ -480,6 +517,11 @@ hookscript — this one is your per-use provisioning hook.)
   you run `export`, after which a copy of the private key also exists on
   your desktop (and in the host's export dir until you delete it).
 - The container is unprivileged with nesting enabled.
+- Root access to the sandbox is key-only, by construction: the template
+  ships root's password locked, the script never sets one, and
+  provisioning pins `PermitRootLogin prohibit-password` — so the PVE
+  GUI console cannot log in and root SSH accepts only the managed
+  keypair (plus `pct enter` from the host).
 - Treat the sandbox like a CI job: least-privileged, revocable credentials
   only.
 - Clobber protects the stopped CT's disk only. For physical-theft threat
