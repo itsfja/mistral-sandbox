@@ -25,6 +25,12 @@
 #                      it from the console at any time. The key lives only
 #                      in the host file and the ephemeral CT — never in
 #                      this script or any repository.
+#   * SSH-KEYED:       a dedicated sandbox keypair is retained on the HOST
+#                      (default /root/.vibe-sandbox-ssh), generated on the
+#                      first `up` and reused for every rebuild; only the
+#                      public half is injected into the CT. The private key
+#                      stays on the host. Override with SSH_PUBKEY to
+#                      reuse an existing key instead.
 #
 # Run ON the Proxmox host as root (uses `pct` / `pveam`).
 # Tested syntax: PVE 8.x. Review flags against your version before first run.
@@ -62,7 +68,8 @@ STORAGE="${STORAGE:-local-lvm}"       # storage for rootfs
 BRIDGE="${BRIDGE:-vmbr0}"
 TEMPLATE="${TEMPLATE:-}"              # e.g. local:vztmpl/debian-12-standard_...tar.zst
                                      # empty = auto-pick newest Debian 12 template
-SSH_PUBKEY="${SSH_PUBKEY:-$HOME/.ssh/id_ed25519.pub}"
+SSH_PUBKEY="${SSH_PUBKEY:-}"           # optional override; empty = managed keypair
+SSH_KEY_FILE="${SSH_KEY_FILE:-/root/.vibe-sandbox-ssh}"   # host-side keypair (permanent)
 SECRETS_FILE="${SECRETS_FILE:-/root/.vibe-sandbox.env}"   # host-side key store
 PROVISION_HOOK="$(dirname "$0")/provision.sh"
 LOCK_FILE="/run/lock/vibe-sandbox.lock"
@@ -73,6 +80,25 @@ die() { echo "error: $*" >&2; exit 1; }
 lock_or_die() {
   exec 9>"$LOCK_FILE"
   flock -n 9 || die "another vibe-sandbox operation is running (serial rebuild only)"
+}
+
+# Permanent, script-managed SSH keypair, retained on the HOST across
+# rebuilds (same pattern as the credential store). Generated once on the
+# first `up`; the public half is injected into every fresh CT. The private
+# key never leaves the host and never enters any repository.
+# With SSH_PUBKEY set, the override is used and no key is generated.
+ensure_ssh_key() {
+  if [ -n "$SSH_PUBKEY" ]; then
+    [ -f "$SSH_PUBKEY" ] || die "no SSH public key at $SSH_PUBKEY (set SSH_PUBKEY)"
+    SSH_KEY_FILE=""
+    return 0
+  fi
+  if [ ! -f "$SSH_KEY_FILE" ]; then
+    ssh-keygen -t ed25519 -N "" -C "vibe-sandbox" -f "$SSH_KEY_FILE" >/dev/null
+    echo "generated sandbox keypair (retained on host): $SSH_KEY_FILE"
+  fi
+  chmod 600 "$SSH_KEY_FILE"
+  SSH_PUBKEY="${SSH_KEY_FILE}.pub"
 }
 
 template_auto() {
@@ -164,7 +190,7 @@ cmd_up() {
   destroy_sandbox
 
   [ "$EUID" -eq 0 ] || die "must run as root on the Proxmox host"
-  [ -f "$SSH_PUBKEY" ] || die "no SSH public key at $SSH_PUBKEY (set SSH_PUBKEY)"
+  ensure_ssh_key
   [ -n "$TEMPLATE" ] || TEMPLATE="$(template_auto)"
 
   echo "building CT $CTID from $TEMPLATE ..."
@@ -201,7 +227,11 @@ cmd_up() {
   fi
 
   echo "sandbox ready."
-  echo "  ssh root@${ip}"
+  if [ -n "$SSH_KEY_FILE" ]; then
+    echo "  ssh -i ${SSH_KEY_FILE} root@${ip}"
+  else
+    echo "  ssh root@${ip}"
+  fi
 }
 
 cmd_down() {
