@@ -392,8 +392,10 @@ provision_base_script() {
 #!/usr/bin/env bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
-# headless-clean locale: the CT ships LANG=en_US.UTF-8 without the
-# locale compiled in, so apt/perl would spam warnings; use C here
+# headless-clean locale for apt/perl: the host's LANG leaks into the CT
+# through pct exec (lxc-attach passes the calling environment) and is
+# usually not compiled into the fresh CT, so apt/perl would spam
+# warnings; use C here
 export LC_ALL=C
 # uv installs the CLI into /root/.local/bin, which is NOT on the PATH
 # of the pct-exec context — the installer treats that as fatal, and
@@ -407,9 +409,10 @@ apt-get install -y -qq --no-install-recommends \
   python3 python3-pip python3-venv \
   unzip zip jq ripgrep man-db sudo locales || true
 
-# make the CT's own declared locale real (its /etc/default/locale says
-# LANG=en_US.UTF-8, but the template ships without it compiled in)
-locale-gen en_US.UTF-8 >/dev/null 2>&1 || true
+# generate the locale that leaked in from the host (now that the
+# `locales` package is installed): subsequent pct exec calls stop
+# warning and the CT matches the host, whatever LANG says
+[ -n "${LANG:-}" ] && locale-gen "$LANG" >/dev/null 2>&1 || true
 
 # current iteration of Mistral tooling, fetched at build time
 curl -LsSf https://mistral.ai/vibe/install.sh | bash
