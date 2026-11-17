@@ -1,0 +1,5 @@
+# host-side credential stores — never commit
+.vibe-sandbox.env
+vibe-sandbox.env
+.env
+*.env
