@@ -8,11 +8,11 @@ outbound internet access — without handing it your machine.
 
 ## Design
 
-- **Single use** — one sandbox at a time (fixed CTID); `down` destroys it
-  completely, nothing persists between uses.
-- **Auto rebuild on startup** — `up` never resumes an old container: it
-  destroys any existing one and rebuilds from the template, so every
-  session starts clean.
+- **Single use** — one sandbox at a time (fixed CTID); nothing persists
+  between uses.
+- **Auto rebuild on startup** — `up` (or a GUI Start) never resumes an old
+  container: it destroys any existing one and rebuilds from the template,
+  so every session starts clean.
 - **Serially rebuildable** — a global `flock` serializes operations and the
   build is deterministic from the config block; rebuild #1 == rebuild #50.
 - **Internet-enabled** — unrestricted outbound net: the agent can download
@@ -28,10 +28,19 @@ outbound internet access — without handing it your machine.
   first `up`, and its public half is injected into every rebuild. The
   private key stays on the host; override with `SSH_PUBKEY` to reuse an
   existing key instead.
+- **GUI-trapped** — the Proxmox GUI drives the lifecycle: right-click
+  Start = fresh rebuild + provisioning; Stop = disk clobber + parked stub;
+  Restart = fresh rebuild. Implemented with a `pct` hookscript, whose shim
+  is auto-deployed on every run. `HOOK=off` disables it.
+- **Clobbered** — on stop, the rootfs is discarded (`CLOBBER=discard`,
+  instant on SSD) or zero-filled (`CLOBBER=zero`, overwrite-grade) and the
+  CT is replaced by a pristine, unprovisioned stopped stub: the GUI keeps a
+  Start-able object while the stopped sandbox holds nothing from the
+  previous session. `CLOBBER=off` skips the wipe.
 
 ## Requirements
 
-- Proxmox VE 8.x; run on the host as root (uses `pct` / `pveam`).
+- Proxmox VE 8.x; run on the host as root (uses `pct` / `pveam` / `pvesm`).
 - A bridge with DHCP (default `vmbr0`).
 - A storage pool for the rootfs (default `local-lvm`).
 - Internet access from the host (the build downloads the container
@@ -82,7 +91,7 @@ cat /root/.vibe-sandbox.env
 ```
 
 Never paste the real key anywhere except this file — not into issues, PRs,
-chats, or screenshots. If you skip this step entirely, `up` still works,
+chats, or screenshots. If you skip this step entirely, builds still work,
 but the first `vibe` launch inside the sandbox will fall back to an
 interactive sign-in.
 
@@ -107,10 +116,10 @@ STORAGE=my-pool BRIDGE=vmbr1 /root/vibe-sandbox.sh up
 ```
 
 The first run downloads the container template, generates the retained
-SSH keypair, and provisions the toolchain and Vibe CLI — expect a few
-minutes. It ends with `sandbox ready.` followed by the ssh line. If you do
-not see both lines, it failed: read the message above them and check
-Troubleshooting below.
+SSH keypair, provisions the toolchain and Vibe CLI, and auto-deploys the
+GUI hookscript shim — expect a few minutes. It ends with `sandbox ready.`
+followed by the ssh line. If you do not see both lines, it failed: read the
+message above them and check Troubleshooting below.
 
 ### 5. Get inside
 
@@ -132,9 +141,47 @@ vibe              # start a session; /whoami shows which credentials are in use
 /root/vibe-sandbox.sh down
 ```
 
-The container is destroyed and cannot be resumed — that is the design.
-Your API key store and SSH keypair stay on the host, and the next `up`
-rebuilds everything fresh in a few minutes.
+The disk is clobbered and the sandbox is parked as a fresh, stopped stub:
+nothing from your session is recoverable from it. Your API key store and
+SSH keypair stay on the host. The next session is either `up` again, or
+just right-click Start on the stub in the Proxmox GUI. To remove the CT
+from the tree entirely, use `purge` instead.
+
+## GUI-driven lifecycle (Proxmox right-click)
+
+With `HOOK=on` (the default), the sandbox CT carries a `pct` hookscript, so
+the Proxmox GUI becomes the front end:
+
+```mermaid
+flowchart TD
+    S["GUI: right-click Start"] --> PS1["pre-start hook:<br/>destroy + recreate fresh"]
+    PS1 --> PVEB["PVE boots the NEW container"]
+    PVEB --> PS2["post-start hook:<br/>provision + inject credentials<br/>ssh line goes to the task log"]
+    T["GUI: right-click Stop / Shutdown"] --> PR2["post-stop hook:<br/>clobber rootfs + park fresh stub"]
+    R["GUI: right-click Restart"] --> PR2
+    PR2 --> S
+```
+
+| GUI action | What actually happens |
+| --- | --- |
+| Start | fresh rebuild from template, then provisioning; the Start task stays busy until provisioning finishes — open its log for the `ssh -i ...` line |
+| Stop / Shutdown | rootfs clobbered (`CLOBBER`), CT replaced by a pristine stopped stub; the GUI keeps a Start-able object holding nothing from the session |
+| Restart | stop phases, then start phases: a fresh rebuild |
+| Snapshot / Clone / Migrate / Backup / Console | **not trappable** (no hook phase) — harmless, since the next Start purges everything, but they cannot be blocked per-CT |
+
+Honest caveats:
+
+- **Test on your PVE build first.** The pre-start hook recreates the CT
+  while PVE is mid-Start on the same vmid. It works because the recreated
+  config and disk volid are identical (same vmid, same storage), but it is
+  the piece most sensitive to PVE updates.
+- **Clobber levels.** `discard` is instant on SSDs and defeats casual and
+  software-level recovery, but relies on the drive honoring TRIM — it is
+  not guaranteed against chip-level forensics. `zero` is overwrite-grade
+  at the cost of a few minutes per stop. Neither protects the *host's* key
+  store: if physical theft is in your threat model, encrypt the PVE root
+  VG with LUKS, and rely on the sandbox's dedicated, instantly revocable
+  API key.
 
 ## Troubleshooting
 
@@ -152,21 +199,28 @@ rebuilds everything fresh in a few minutes.
 - `another vibe-sandbox operation is running` — a build is in progress;
   the script refuses to run two at a time by design. Wait for it to
   finish (or check `ps aux | grep vibe-sandbox`).
+- `clobber: blkdiscard failed` — your rootfs sits on rotational storage;
+  use `CLOBBER=zero` for overwrite-grade wiping.
+- GUI Start finishes but no ssh line in the task log — the post-start
+  hook found no IP or provisioning failed; read the task log output
+  above it, and the same checks as the `no IP` case apply.
 
 ## Subcommands
 
 | Command | Action |
 | --- | --- |
 | `up` | destroy any prior sandbox, rebuild, start, provision, print ssh line |
-| `down` | stop and destroy completely |
+| `down` | clobber the disk and park a fresh stopped stub (GUI Start-able) |
+| `purge` | destroy completely — no stub, gone from the tree |
 | `reset` | `down` then `up` — fresh rebuild mid-work |
 | `status` | is the sandbox up? CTID, state, IP |
 | `ip` | print the current IP (empty if not running) |
 | `shell` | drop into a root shell inside the CT |
+| `hook` | internal — called by the PVE hookscript shim with (vmid, phase) |
 
 ## Credential store (rotation and revocation)
 
-Every `up` pushes `/root/.vibe-sandbox.env` into the fresh container as
+Every build pushes `/root/.vibe-sandbox.env` into the fresh container as
 `/root/.vibe/.env`, which the Vibe CLI loads automatically on startup.
 Rotate or revoke the key from the Mistral console at any time; to rotate
 locally, just edit the host file — the next rebuild picks it up. Use a
@@ -178,13 +232,16 @@ Mistral usage.
 All overridable by environment variables: `CTID`, `CTHOST`, `CORES`,
 `RAM_MB`, `SWAP_MB`, `DISK_GB`, `STORAGE`, `BRIDGE`, `TEMPLATE`,
 `SSH_PUBKEY` (use an existing key instead of the managed one),
-`SSH_KEY_FILE` (where the managed keypair lives), `SECRETS_FILE`.
+`SSH_KEY_FILE` (where the managed keypair lives), `SECRETS_FILE`,
+`HOOK` (`on`/`off`: GUI lifecycle trapping), `CLOBBER`
+(`discard`/`zero`/`off`: post-stop rootfs wipe).
 
 ## Hooks
 
 Place a `provision.sh` beside the script to run extra setup inside each
 fresh container after base provisioning (toolchains, repo clones). Keep it
-deterministic to keep rebuilds identical.
+deterministic to keep rebuilds identical. (Unrelated to the PVE
+hookscript — this one is your per-use provisioning hook.)
 
 ## Auto-rebuild on host boot (optional)
 
@@ -202,3 +259,6 @@ deterministic to keep rebuilds identical.
 - The container is unprivileged with nesting enabled.
 - Treat the sandbox like a CI job: least-privileged, revocable credentials
   only.
+- Clobber protects the stopped CT's disk only. For physical-theft threat
+  models, LUKS-encrypt the PVE host and keep the sandbox API key dedicated
+  and instantly revocable.
