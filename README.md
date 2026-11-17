@@ -332,6 +332,12 @@ with the refusal message in the task log rather than touching the CT.
   CT sits at that ID. Move it or set `CTID` to a free ID; only if you are
   certain it is an old sandbox, tag it manually:
   `pct set <id> --tags vibe-sandbox`.
+- `400 Parameter verification failed. ostemplate: value may only be 255
+  characters long` — an older script version captured the template
+  download's progress log into the template name on the first run (before
+  the template was cached). Update the script (the step-1 `curl` one-liner
+  again) and re-run `up`: the downloaded template is kept, so the retry
+  skips the download and builds normally.
 - `ssh vibe-sandbox` connects to nothing after a rebuild — the IP in your
   ssh config went stale (DHCP). Re-run `export` on the host and re-fetch,
   or edit the `HostName` line in your ssh config; the key itself is still
