@@ -397,7 +397,7 @@ export DEBIAN_FRONTEND=noninteractive
 export LC_ALL=C
 # uv installs the CLI into /root/.local/bin, which is NOT on the PATH
 # of the pct-exec context — the installer treats that as fatal, and
-vibe --version below would fail the same way — so put it up front
+# `vibe --version` below would fail the same way — so put it up front
 export PATH="/root/.local/bin:$PATH"
 
 # general-purpose baseline: the agent extends this at runtime as needed
