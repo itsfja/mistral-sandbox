@@ -31,6 +31,13 @@
 #                      public half is injected into the CT. The private key
 #                      stays on the host. Override with SSH_PUBKEY to
 #                      reuse an existing key instead.
+#   * MAC-RETAINED:    the sandbox's MAC address is generated once and
+#                      retained on the HOST ($MAC_FILE, default
+#                      /root/.vibe-sandbox.mac), then pinned (hwaddr) on
+#                      every rebuild — PVE would otherwise mint a fresh
+#                      random MAC each time. A DHCP reservation for that
+#                      MAC therefore keeps the same IP across rebuilds.
+#                      Override with CT_MAC to pin a specific MAC.
 #   * GUI-TRAPPED:      with HOOK=on (default), the Proxmox GUI drives the
 #                      whole lifecycle through a pct hookscript:
 #                        right-click Start   = fresh rebuild + provisioning
@@ -94,6 +101,8 @@ TEMPLATE="${TEMPLATE:-}"              # e.g. local:vztmpl/debian-12-standard_...
                                      # empty = auto-pick newest Debian 12 template
 SSH_PUBKEY="${SSH_PUBKEY:-}"           # optional override; empty = managed keypair
 SSH_KEY_FILE="${SSH_KEY_FILE:-/root/.vibe-sandbox-ssh}"   # host-side keypair (permanent)
+MAC_FILE="${MAC_FILE:-/root/.vibe-sandbox.mac}"  # host-side MAC store (permanent)
+CT_MAC="${CT_MAC:-}"                   # optional override; empty = managed MAC
 SECRETS_FILE="${SECRETS_FILE:-/root/.vibe-sandbox.env}"   # host-side key store
 HOOK="${HOOK:-on}"                    # on = attach PVE hookscript (GUI trap)
 CLOBBER="${CLOBBER:-discard}"         # discard | zero | off — post-stop rootfs wipe
@@ -129,6 +138,26 @@ ensure_ssh_key() {
   fi
   chmod 600 "$SSH_KEY_FILE"
   SSH_PUBKEY="${SSH_KEY_FILE}.pub"
+}
+
+# Permanent, script-managed MAC, retained on the HOST across rebuilds
+# (same pattern as the keypair). Without a pinned hwaddr, every recreate
+# would get a fresh random MAC from PVE, which silently breaks DHCP
+# reservations. Generated once on the first build; pinned on every
+# recreate. With CT_MAC set, the override is used and none is generated.
+ensure_mac() {
+  [ -n "$CT_MAC" ] && return 0
+  if [ -s "$MAC_FILE" ]; then
+    CT_MAC="$(cat "$MAC_FILE")"
+  else
+    # locally administered unicast (02:xx:xx:xx:xx:xx), otherwise random
+    CT_MAC="02:$(od -An -N5 -tx1 /dev/urandom | tr -d ' \n' | sed 's/../&:/g;s/:$//')"
+    printf '%s\n' "$CT_MAC" > "$MAC_FILE"
+    chmod 600 "$MAC_FILE"
+    echo "generated sandbox MAC (retained on host): $CT_MAC"
+  fi
+  echo "$CT_MAC" | grep -Eq '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$' \
+    || die "invalid MAC '$CT_MAC' in $MAC_FILE — delete the file or set CT_MAC"
 }
 
 # Auto-deploy the PVE hookscript shim (idempotent). The shim only forwards
@@ -207,15 +236,17 @@ destroy_sandbox() {
 # Create the sandbox CT. $1 = start | stopped. The hookscript is attached
 # whenever HOOK=on so the GUI trap works on every incarnation, stub included.
 # The ownership tag is set here; guard_ct() enforces it before any destroy.
+# The retained MAC is pinned via hwaddr so DHCP reservations survive rebuilds.
 create_sandbox() {
   local hookargs=() startargs=()
+  ensure_mac
   [ "$HOOK" = "on" ] && hookargs=(--hookscript "$HOOK_VOL_ID")
   [ "${1:-start}" = "start" ] && startargs=(--start 1)
   pct create "$CTID" "$TEMPLATE" \
     --hostname "$CTHOST" \
     --cores "$CORES" --memory "$RAM_MB" --swap "$SWAP_MB" \
     --rootfs "${STORAGE}:${DISK_GB}" \
-    --net0 "name=eth0,bridge=${BRIDGE},ip=dhcp" \
+    --net0 "name=eth0,bridge=${BRIDGE},ip=dhcp${CT_MAC:+,hwaddr=$CT_MAC}" \
     --unprivileged 1 \
     --features nesting=1 \
     --ssh-public-keys "$SSH_PUBKEY" \
@@ -375,9 +406,11 @@ cmd_purge() {
 # Desktop bundle: copy the managed keypair + an ssh-config snippet +
 # per-OS instructions, so the sandbox can be used from a desktop (Windows
 # or Linux) instead of the PVE console. The keypair is permanent, so one
-# export unlocks every future rebuild; only the embedded IP goes stale per
-# rebuild. Honest cost: the private key then also exists in $EXPORT_DIR and
-# on the desktop — delete the export dir after fetching the tarball.
+# export unlocks every future rebuild; only the embedded IP may go stale
+# per rebuild — unless a DHCP reservation pins it (the MAC is retained
+# across rebuilds, so one reservation holds forever).
+# Honest cost: the private key then also exists in $EXPORT_DIR and on the
+# desktop — delete the export dir after fetching the tarball.
 cmd_export() {
   lock_or_die
   [ "$EUID" -eq 0 ] || die "must run as root on the Proxmox host"
@@ -386,7 +419,7 @@ cmd_export() {
   local ip mac hostip
   ip="$(sandbox_ip)"
   [ -n "$ip" ] || die "no IP for the sandbox (check ${BRIDGE}/DHCP)"
-  mac="$(pct config "$CTID" | awk -F'[,=]' '/^net0:/ {for (i=1;i<=NF;i++) if ($i=="hwaddr") print $(i+1)}')"
+  mac="$(pct config "$CTID" | awk -F'[,=]' '/^net0:/ {for (i=1;i<=NF;i++) if ($i==\"hwaddr\") print $(i+1)}')"
   hostip="$(hostname -I | awk '{print $1}')"
 
   mkdir -p "$EXPORT_DIR"
@@ -399,7 +432,8 @@ cmd_export() {
   cat > "$EXPORT_DIR/ssh-config" <<EOF
 # vibe-sandbox — append to ~/.ssh/config (Linux/macOS)
 # or %USERPROFILE%\.ssh\config (Windows). HostName goes stale after each
-# rebuild: re-run 'export' on the host, or edit the IP below.
+# rebuild UNLESS you set a DHCP reservation for the sandbox MAC (see
+# README.txt) — the MAC is permanent, so the reservation holds forever.
 Host vibe-sandbox
     HostName $ip
     User root
@@ -418,11 +452,18 @@ Contents:
   ssh-config          ssh config snippet -> 'ssh vibe-sandbox'
   README.txt          this file
 
-The keypair is permanent: one export unlocks every future rebuild. Only
-the HostName (IP) goes stale after each rebuild — re-run 'export' on the
-host, or set a DHCP reservation for the sandbox MAC
-  ${mac:-unknown}
-to make the IP stable.
+The keypair is permanent: one export unlocks every future rebuild.
+
+FIX THE IP (recommended)
+------------------------
+  The sandbox MAC is also permanent — retained on the host across
+  rebuilds — so reserve the IP for it on your DHCP server (router,
+  pfSense/OPNsense, Pi-hole, whatever hands out addresses):
+    ${mac:-unknown}
+  With that reservation, the IP below never goes stale and 'ssh
+  vibe-sandbox' just works after every rebuild. Without it, only the
+  HostName (IP) goes stale per rebuild — re-run 'export' on the host and
+  re-fetch, or edit the HostName line in your ssh config.
 
 Current sandbox IP: $ip
 
@@ -467,7 +508,9 @@ EOF
   echo "  fetch from your desktop (host SSH must be reachable from your LAN):"
   echo "    scp root@${hostip}:$EXPORT_DIR/vibe-sandbox-desktop.tar.gz ."
   echo "  then follow the README.txt inside; connect with: ssh vibe-sandbox"
-  echo "note: re-run 'export' after each rebuild — only the IP changes; the key is permanent"
+  echo "recommended: set a DHCP reservation for the sandbox MAC ${mac:-unknown} —"
+  echo "  it is retained across rebuilds, so the IP stays stable forever"
+  echo "note: without a reservation, re-run 'export' after each rebuild — only the IP changes; the key is permanent"
 }
 
 # INTERNAL: entry point for the PVE hookscript shim. PVE calls the shim with

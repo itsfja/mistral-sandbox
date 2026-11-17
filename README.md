@@ -28,14 +28,20 @@ outbound internet access — without handing it your machine.
   first `up`, and its public half is injected into every rebuild. The
   private key stays on the host; override with `SSH_PUBKEY` to reuse an
   existing key instead.
+- **MAC-kept** — the sandbox's MAC address is generated once and retained
+  on the host (default `/root/.vibe-sandbox.mac`), then pinned on every
+  rebuild — PVE would otherwise mint a fresh random MAC each time, silently
+  breaking DHCP reservations. Fix the sandbox IP by reserving it on your
+  DHCP server for that MAC: the reservation then holds for every future
+  rebuild. Override with `CT_MAC`.
 - **GUI-trapped** — the Proxmox GUI drives the lifecycle: right-click
   Start = fresh rebuild + provisioning; Stop = disk clobber + parked stub;
   Restart = fresh rebuild. Implemented with a `pct` hookscript, whose shim
   is auto-deployed on every run. `HOOK=off` disables it.
 - **Clobbered** — on stop, the rootfs is discarded (`CLOBBER=discard`,
   instant on SSD) or zero-filled (`CLOBBER=zero`, overwrite-grade) and the
-  CT is replaced by a pristine, unprovisioned stopped stub: the GUI keeps a
-  Start-able object while the stopped sandbox holds nothing from the
+  CT is replaced by a pristine, unprovisioned stopped stub: the GUI keeps
+  a Start-able object while the stopped sandbox holds nothing from the
   previous session. `CLOBBER=off` skips the wipe.
 - **Ownership-guarded** — every destroy or clobber first verifies the CT
   carries this script's ownership tag (`vibe-sandbox`) and the sandbox
@@ -211,12 +217,33 @@ cat ssh-config >> ~/.ssh/config
 ssh vibe-sandbox
 ```
 
+### Fix the IP on your DHCP server (recommended)
+
+The sandbox gets its address over DHCP, so the IP can change on every
+rebuild — but the **MAC address is permanent**: the script retains it on
+the host (default `/root/.vibe-sandbox.mac`, like the keypair) and pins it
+on every rebuild. So fix the IP once on whatever hands out addresses
+(router, pfSense/OPNsense, Pi-hole, Windows DHCP...): create a DHCP
+reservation for the sandbox MAC, and the same IP comes back for every
+future rebuild — `ssh vibe-sandbox` then works forever without touching
+your ssh config again.
+
+Find the MAC with any of:
+
+```bash
+pct config 1042 | grep net0        # hwaddr=... on the host
+cat /root/.vibe-sandbox.mac        # the retained MAC store
+```
+
+`export` also prints it and lists it in the bundle README.txt.
+
 Notes:
 
 - **The keypair is permanent**: one export unlocks every future rebuild.
-  Only the IP embedded in `ssh-config` goes stale after each rebuild —
-  re-run `export`, or set a DHCP reservation for the MAC the bundle lists
-  to make the IP stable.
+  Only the IP embedded in `ssh-config` can go stale after each rebuild —
+  re-run `export`, or avoid it entirely with the DHCP reservation above
+  (the MAC it binds is retained across rebuilds, so the reservation holds
+  forever).
 - `export` requires a running sandbox (it embeds the current IP) and the
   managed keypair; with an `SSH_PUBKEY` override, export your own key
   yourself — the script will not copy keys it does not manage.
@@ -308,7 +335,9 @@ with the refusal message in the task log rather than touching the CT.
 - `ssh vibe-sandbox` connects to nothing after a rebuild — the IP in your
   ssh config went stale (DHCP). Re-run `export` on the host and re-fetch,
   or edit the `HostName` line in your ssh config; the key itself is still
-  valid, so only the IP needs changing.
+  valid, so only the IP needs changing. To make it permanent, set a DHCP
+  reservation for the sandbox MAC (retained across rebuilds): see
+  [Fix the IP on your DHCP server](#fix-the-ip-on-your-dhcp-server-recommended).
 - GUI Start finishes but no ssh line in the task log — the post-start
   hook found no IP or provisioning failed; read the task log output
   above it, and the same checks as the `no IP` case apply.
@@ -341,9 +370,10 @@ Mistral usage.
 All overridable by environment variables: `CTID`, `CTHOST`, `CORES`,
 `RAM_MB`, `SWAP_MB`, `DISK_GB`, `STORAGE`, `BRIDGE`, `TEMPLATE`,
 `SSH_PUBKEY` (use an existing key instead of the managed one),
-`SSH_KEY_FILE` (where the managed keypair lives), `SECRETS_FILE`,
-`HOOK` (`on`/`off`: GUI lifecycle trapping), `CLOBBER`
-(`discard`/`zero`/`off`: post-stop rootfs wipe), `SANDBOX_TAG`
+`SSH_KEY_FILE` (where the managed keypair lives), `MAC_FILE` (where the
+retained MAC lives), `CT_MAC` (pin a specific MAC instead of the managed
+one), `SECRETS_FILE`, `HOOK` (`on`/`off`: GUI lifecycle trapping),
+`CLOBBER` (`discard`/`zero`/`off`: post-stop rootfs wipe), `SANDBOX_TAG`
 (ownership tag enforced by the guard before any destroy or wipe),
 `EXPORT_DIR` (where the desktop bundle is written).
 
