@@ -350,6 +350,13 @@ with the refusal message in the task log rather than touching the CT.
   it, aborting the very start it was part of. Update the script
   (`update` subcommand, or the step-1 `curl` one-liner) and re-run
   `up`: the half-built CT is destroyed first and the rebuild proceeds.
+- `up` aborts right after the Vibe installer's `[ERROR] Your PATH does
+  not include ...` (no `sandbox ready.` line) — a script from before
+  the provisioning PATH fix: provisioning died when the installer
+  exited nonzero over the missing `~/.local/bin` PATH, so the CT was
+  left WITHOUT credentials (`/root/.vibe/.env` never injected).
+  Update the script and re-run `up` for a clean rebuild; the
+  half-provisioned CT is destroyed first.
 - `clobber: blkdiscard failed` — your rootfs sits on rotational storage;
   use `CLOBBER=zero` for overwrite-grade wiping.
 - `refusing to touch CT <id>: it is not this script's sandbox` — the

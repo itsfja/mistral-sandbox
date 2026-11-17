@@ -392,13 +392,24 @@ provision_base_script() {
 #!/usr/bin/env bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
+# headless-clean locale: the CT ships LANG=en_US.UTF-8 without the
+# locale compiled in, so apt/perl would spam warnings; use C here
+export LC_ALL=C
+# uv installs the CLI into /root/.local/bin, which is NOT on the PATH
+# of the pct-exec context — the installer treats that as fatal, and
+vibe --version below would fail the same way — so put it up front
+export PATH="/root/.local/bin:$PATH"
 
 # general-purpose baseline: the agent extends this at runtime as needed
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
   ca-certificates curl wget git build-essential \
   python3 python3-pip python3-venv \
-  unzip zip jq ripgrep man-db sudo || true
+  unzip zip jq ripgrep man-db sudo locales || true
+
+# make the CT's own declared locale real (its /etc/default/locale says
+# LANG=en_US.UTF-8, but the template ships without it compiled in)
+locale-gen en_US.UTF-8 >/dev/null 2>&1 || true
 
 # current iteration of Mistral tooling, fetched at build time
 curl -LsSf https://mistral.ai/vibe/install.sh | bash
