@@ -3,3 +3,7 @@
 vibe-sandbox.env
 .env
 *.env
+
+# host-side sandbox SSH keypair — never commit
+.vibe-sandbox-ssh
+.vibe-sandbox-ssh.pub
