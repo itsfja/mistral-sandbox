@@ -481,6 +481,16 @@ print_ssh_line() {
   fi
 }
 
+# Every rebuild mints a fresh SSH host key, so a stale known_hosts
+# entry for the sandbox IP on the HOST makes the ssh line above die
+# with REMOTE HOST IDENTIFICATION HAS CHANGED on the second rebuild.
+# Purge the stale entry at generation time; strict host-key checking
+# stays fully on for every other host.
+purge_known_hosts() {   # $1 = sandbox IP
+  [ -n "${1:-}" ] || return 0
+  ssh-keygen -R "$1" >/dev/null 2>&1 || true
+}
+
 # --------------------------- subcommands ------------------------------------
 cmd_up() {
   self_check up
@@ -498,6 +508,9 @@ cmd_up() {
 
   local ip
   ip="$(wait_for_ip)" || { echo "container started but no IP (check ${BRIDGE}/DHCP)"; exit 1; }
+
+  # fresh host key per rebuild: drop the stale host-side entry now
+  purge_known_hosts "$ip"
 
   provision_and_report
 
@@ -685,6 +698,7 @@ cmd_hook() {
       hook_lock "$phase" || exit 0
       local ip
       ip="$(wait_for_ip)" || { echo "post-start: no IP (check ${BRIDGE}/DHCP)"; exit 0; }
+      purge_known_hosts "$ip"
       provision_and_report
       echo "sandbox ready via GUI."
       print_ssh_line "$ip"

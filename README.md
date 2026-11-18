@@ -117,6 +117,14 @@ chats, or screenshots. If you skip this step entirely, builds still work,
 but the first `vibe` launch inside the sandbox will fall back to an
 interactive sign-in.
 
+Make it a **Vibe** key, not a Studio key: both authenticate against
+the API, but only a Vibe key carries the Vibe Code entitlement — a
+Studio key leaves every prompt inside the sandbox failing with
+`Invalid API key` (see Troubleshooting). Note that only one Vibe key
+exists at a time: creating a new one revokes the previous Vibe key
+wherever it was used, so keep a separate Studio key for non-Vibe
+projects.
+
 ### 3. Check three host settings (two minutes)
 
 ```bash
@@ -188,6 +196,12 @@ any time. Once inside, confirm the tooling:
 vibe --version    # the CLI is installed
 vibe              # start a session; /whoami shows which credentials are in use
 ```
+
+If a session starts but every prompt comes back `Invalid API key`,
+the key itself is usually fine — check `/whoami` first (plan, key
+scope, credential source); if the preset model is not entitled to the
+key, switch presets with `/model`. The `Invalid API key` entry in
+Troubleshooting covers the full story.
 
 Or work from your desktop instead of the host: see
 [From your desktop (export)](#from-your-desktop-export) below.
@@ -439,6 +453,26 @@ with the refusal message in the task log rather than touching the CT.
   defaults to the first address from `hostname -I`; on multi-homed
   hosts that may not be your LAN address. Rerun with
   `HOST_IP=<reachable-address> /root/vibe-sandbox.sh export`.
+- `ssh -i /root/.vibe-sandbox-ssh root@<ip>` on the **host** fails
+  after a rebuild with `REMOTE HOST IDENTIFICATION HAS CHANGED` —
+  the same expected host-key rotation, host side: every rebuild mints
+  a fresh host key. `up` and GUI Start purge the stale `known_hosts`
+  entry for the sandbox IP automatically at build time; if you still
+  hit it (connected before the purge ran, or with a pre-purge script),
+  recover with `ssh-keygen -R <ip>` and reconnect.
+- Every prompt inside the sandbox fails with `Invalid API key`, yet
+  the key is demonstrably valid — `/whoami` authenticates and the
+  Mistral console shows the key active — and `/whoami` reports
+  `Plan: Free` on a paid account: the key is a **Studio** key. Studio
+  keys authenticate but carry no Vibe Code entitlement, so model
+  calls come back `tier_not_allowed`, which the CLI misleadingly
+  surfaces as "Invalid API key" plus a Free plan. Fix: create a
+  **Vibe** key at chat.mistral.ai (Code > Vibe CLI) — only one Vibe
+  key exists at a time, and creating it revokes the previous one, so
+  keep a separate Studio key for non-Vibe projects — then update the
+  host store (`printf 'MISTRAL_API_KEY=<new-key>\n' > /root/.vibe-sandbox.env`)
+  and run `up` again. `/whoami` should then show the paid plan and
+  `Key scope: vibe`.
 
 ## Subcommands
 
