@@ -146,6 +146,7 @@ GUARD_STAMP_TTL=600                   # seconds a guard pass remains valid
 RESCUE="${RESCUE:-1}"                 # 1 = before an approved guarded teardown, vzdump the CT to rescue storage
 RESCUE_STORAGE="${RESCUE_STORAGE:-}"  # backup storage for rescue archives; auto-detected when empty
 RESCUE_KEEP="${RESCUE_KEEP:-2}"       # rescue archives of this CT to keep on the storage
+STORAGE_CFG="${STORAGE_CFG:-/etc/pve/storage.cfg}"  # storage definitions (content/path lookup)
 
 # --------------------------- helpers ---------------------------------------
 die() { echo "error: $*" >&2; exit 1; }
@@ -346,20 +347,46 @@ sandbox_work_findings() {   # echoes findings for a running CT; empty = clean
   ' 2>/dev/null
 }
 
+storage_cfg_value() {   # $1 = storage name, $2 = key (content|path) from $STORAGE_CFG
+  awk -v s="$1" -v key="$2" '
+    /^[A-Za-z0-9]+: / { sec = ($2 == s) }
+    sec && $1 == key { print $2; exit }
+  ' "$STORAGE_CFG" 2>/dev/null
+}
+
 rescue_storage() {   # rescue backup storage: explicit RESCUE_STORAGE, else auto
+  local pick contents
   if [ -n "$RESCUE_STORAGE" ]; then
-    if pvesm status | awk -v s="$RESCUE_STORAGE" '$1 == s && /backup/ {ok = 1} END {exit !ok}'; then
-      echo "$RESCUE_STORAGE"
-      return 0
-    fi
-    echo "rescue: RESCUE_STORAGE '$RESCUE_STORAGE' has no backup content (pvesm status)" >&2
+    contents="$(storage_cfg_value "$RESCUE_STORAGE" content)"
+    case ",${contents}," in
+      *",backup,"*)
+        echo "$RESCUE_STORAGE"
+        return 0
+        ;;
+      *)
+        echo "rescue: RESCUE_STORAGE '$RESCUE_STORAGE' has no backup content ($STORAGE_CFG says '${contents:-nothing}')" >&2
+        return 1
+        ;;
+    esac
+  fi
+  # Auto-detect from $STORAGE_CFG: pvesm status prints no Content column,
+  # so it cannot tell us which storages accept backups. Prefer the first
+  # non-local storage with backup content; fall back to local (archives
+  # share the host boot disk) rather than fail, with the caveat logged.
+  pick="$(awk '
+    /^[A-Za-z0-9]+: / { name = $2 }
+    name && $1 == "content" && $2 ~ /(^|,)backup(,|$)/ {
+      if (name != "local" && !printed) { print name; printed = 1 }
+      if (name == "local") fallback = 1
+    }
+    END { if (!printed && fallback) print "local" }
+  ' "$STORAGE_CFG" 2>/dev/null)"
+  if [ -z "$pick" ]; then
+    echo "rescue: no storage with backup content in $STORAGE_CFG; add one or set RESCUE_STORAGE" >&2
     return 1
   fi
-  local pick
-  pick="$(pvesm status 2>/dev/null | awk '$1 != "local" && $1 != "Name" && /backup/ {print $1; exit}')"
-  if [ -z "$pick" ]; then
-    echo "rescue: no backup-capable storage found (pvesm status); add one or set RESCUE_STORAGE" >&2
-    return 1
+  if [ "$pick" = "local" ]; then
+    echo "rescue: only 'local' has backup content; archives share the host boot disk" >&2
   fi
   echo "$pick"
 }
@@ -381,7 +408,7 @@ rescue_archive() {   # vzdump the CT to rescue storage before an approved teardo
   archive="$(printf '%s\n' "$out" | sed -n "s/.*creating vzdump archive '\([^']*\)'.*/\1/p" | head -n 1)"
   echo "rescue: archive created${archive:+: $archive}"
   # retention: keep only the newest RESCUE_KEEP archives of this CT
-  path="$(pvesm config "$storage" 2>/dev/null | awk '/^path:?/ {print $2; exit}')"
+  path="$(storage_cfg_value "$storage" path)"
   [ -n "$path" ] || return 0   # e.g. PBS storage manages its own retention
   dumpdir="$path/dump"
   ls -1t "$dumpdir"/vzdump-lxc-"$CTID"-*.tar.* 2>/dev/null |

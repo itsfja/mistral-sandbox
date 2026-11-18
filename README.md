@@ -55,7 +55,8 @@ outbound internet access — without handing it your machine.
   the teardown (interactive default-No confirm; fail-closed when
   unattended, e.g. cron) unless `FORCE=1`. An approved teardown is
   rescue-archived first: the whole CT is dumped with `vzdump` to backup
-  storage (auto-detected from `pvesm status`, or `RESCUE_STORAGE`),
+  storage (auto-detected from `/etc/pve/storage.cfg`, or set in
+  `RESCUE_STORAGE`),
   keeping the last `RESCUE_KEEP` archives, so an approved destruction is
   still recoverable; a failed archive aborts with nothing destroyed.
   `RESCUE=0` skips the archive.
@@ -490,8 +491,9 @@ with the refusal message in the task log rather than touching the CT.
   permanently lose them. Push or extract the work, then re-run;
   `FORCE=1 <command>` proceeds without prompting (a rescue archive is
   still taken first when work is found). On approval, the whole CT is
-  archived with `vzdump` to the first backup-capable storage
-  (`pvesm status`), or the one named in `RESCUE_STORAGE`; only the last
+  archived with `vzdump` to the first storage whose content includes
+  backup in `/etc/pve/storage.cfg` (on your host that is
+  `unraid-iso-backup`), or the one named in `RESCUE_STORAGE`; only the last
   `RESCUE_KEEP` archives are kept. If the archive fails, nothing is
   destroyed. Recover one with `pct restore 1042 <archive>`, or extract
   files straight out of the tar. GUI
