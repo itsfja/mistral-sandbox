@@ -56,7 +56,8 @@ launch() {
 
 command -v ssh  >/dev/null 2>&1 || die "ssh not found (install openssh-client)"
 command -v code >/dev/null 2>&1 || die "'code' CLI not found (in VS Code: Command Palette > 'Shell Command: Install code command in PATH')"
-[ -n "$PVE_HOST" ] || die "PVE_HOST is not set, e.g. PVE_HOST=root@192.168.3.188 bash vscode-connect.sh"
+[ -n "$PVE_HOST" ] || die "PVE_HOST is not set, e.g. PVE_HOST=root@192.168.3.188 bash vscode-connect.sh (transient: that shell only)
+  or make it permanent: add 'export PVE_HOST=root@192.168.3.188' to ~/.bashrc (macOS: ~/.zshrc)"
 case "$WORKSPACE" in /*) ;; *) WORKSPACE="/$WORKSPACE" ;; esac
 
 probe() { ssh "${SSH_OPTS[@]}" "$SSH_ALIAS" true >/dev/null 2>&1; }

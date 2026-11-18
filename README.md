@@ -383,6 +383,21 @@ $env:PVE_HOST = 'root@192.168.3.188'
 .\vscode-connect.ps1
 ```
 
+The `$env:` and command-line-prefix forms above are transient: they
+cover that window or that single run only. To stop ever setting
+`PVE_HOST`, make it a persistent user environment variable, one time
+from any PowerShell:
+
+```powershell
+[Environment]::SetEnvironmentVariable('PVE_HOST', 'root@192.168.3.188', 'User')
+```
+
+then **open a new window** (already-open windows never see the change);
+new processes inherit it automatically. On Linux/macOS the equivalent is
+a line `export PVE_HOST=root@192.168.3.188` in `~/.bashrc`
+(or `~/.zshrc`). The not-set error in both scripts prints these
+permanent forms when it fires.
+
 What a run does:
 
 - Fast path: tries `ssh vibe-sandbox` as-is first; if it works (say, a
