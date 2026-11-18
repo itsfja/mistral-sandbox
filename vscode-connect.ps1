@@ -55,7 +55,7 @@ if (-not (Get-Command code -ErrorAction SilentlyContinue)) {
   Die "'code' CLI not found; in VS Code: Command Palette > 'Shell Command: Install code command in PATH'"
 }
 if (-not $PveHost) {
-  Die "PVE_HOST is not set, e.g. `$env:PVE_HOST = 'root@192.168.3.188'; .\vscode-connect.ps1"
+  Die "PVE_HOST is not set, e.g. `$env:PVE_HOST = 'root@192.168.3.188'; .\vscode-connect.ps1 (transient: this window only)`n  or make it permanent: [Environment]::SetEnvironmentVariable('PVE_HOST', 'root@192.168.3.188', 'User'), then open a new window"
 }
 
 # --- fast path: alias already works ------------------------------------
