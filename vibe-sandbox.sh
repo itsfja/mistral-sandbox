@@ -144,7 +144,7 @@ FORCE="${FORCE:-0}"                   # 1 = skip the work-loss guard entirely
 GUARD_STAMP="/run/lock/vibe-sandbox.workguard-ok"  # fresh pass lets the hook pre-stop through
 GUARD_STAMP_TTL=600                   # seconds a guard pass remains valid
 RESCUE="${RESCUE:-1}"                 # 1 = before an approved guarded teardown, vzdump the CT to rescue storage
-RESCUE_STORAGE="${RESCUE_STORAGE:-unraid-lvm}"  # backup storage for rescue archives; "auto" = first storage with backup content
+RESCUE_STORAGE="${RESCUE_STORAGE:-unraid-lvm,auto}"  # rescue backup storages in preference order; "auto" = first with backup content
 RESCUE_KEEP="${RESCUE_KEEP:-2}"       # rescue archives of this CT to keep on the storage
 STORAGE_CFG="${STORAGE_CFG:-/etc/pve/storage.cfg}"  # storage definitions (content/path lookup)
 
@@ -354,26 +354,12 @@ storage_cfg_value() {   # $1 = storage name, $2 = key (content|path) from $STORA
   ' "$STORAGE_CFG" 2>/dev/null
 }
 
-rescue_storage() {   # rescue backup storage: pinned (default), explicit, or auto
-  local pick contents
-  [ "$RESCUE_STORAGE" = "auto" ] && RESCUE_STORAGE=""
-  if [ -n "$RESCUE_STORAGE" ]; then
-    contents="$(storage_cfg_value "$RESCUE_STORAGE" content)"
-    case ",${contents}," in
-      *",backup,"*)
-        echo "$RESCUE_STORAGE"
-        return 0
-        ;;
-      *)
-        echo "rescue: RESCUE_STORAGE '$RESCUE_STORAGE' has no backup content ($STORAGE_CFG says '${contents:-nothing}')" >&2
-        return 1
-        ;;
-    esac
-  fi
-  # Auto-detect from $STORAGE_CFG: pvesm status prints no Content column,
-  # so it cannot tell us which storages accept backups. Prefer the first
-  # non-local storage with backup content; fall back to local (archives
-  # share the host boot disk) rather than fail, with the caveat logged.
+rescue_storage_autodetect() {   # first non-local storage with backup content; local fallback
+  # Detection happens in $STORAGE_CFG: pvesm status prints no Content
+  # column, so it cannot tell which storages accept backups. Prefer the
+  # first non-local storage with backup content; fall back to local
+  # (archives share the host boot disk) with the caveat logged.
+  local pick
   pick="$(awk '
     /^[A-Za-z0-9]+: / { name = $2 }
     name && $1 == "content" && $2 ~ /(^|,)backup(,|$)/ {
@@ -383,13 +369,43 @@ rescue_storage() {   # rescue backup storage: pinned (default), explicit, or aut
     END { if (!printed && fallback) print "local" }
   ' "$STORAGE_CFG" 2>/dev/null)"
   if [ -z "$pick" ]; then
-    echo "rescue: no storage with backup content in $STORAGE_CFG; add one or set RESCUE_STORAGE" >&2
     return 1
   fi
   if [ "$pick" = "local" ]; then
     echo "rescue: only 'local' has backup content; archives share the host boot disk" >&2
   fi
   echo "$pick"
+}
+
+rescue_storage() {   # rescue backup storage: ordered preference list of IDs / "auto"
+  local list="${RESCUE_STORAGE:-auto}" candidate contents pick saved_ifs
+  saved_ifs="$IFS"
+  IFS=','
+  for candidate in $list; do
+    IFS="$saved_ifs"
+    candidate="$(printf '%s' "$candidate" | tr -d ' \t')"
+    [ -n "$candidate" ] || continue
+    if [ "$candidate" = "auto" ]; then
+      pick="$(rescue_storage_autodetect)"
+      if [ -n "$pick" ]; then
+        echo "$pick"
+        return 0
+      fi
+      echo "rescue: 'auto' found no storage with backup content in $STORAGE_CFG" >&2
+      continue
+    fi
+    contents="$(storage_cfg_value "$candidate" content)"
+    case ",${contents}," in
+      *",backup,"*)
+        echo "$candidate"
+        return 0
+        ;;
+    esac
+    echo "rescue: '$candidate' has no backup content ($STORAGE_CFG says '${contents:-nothing}'), skipping" >&2
+  done
+  IFS="$saved_ifs"
+  echo "rescue: no usable storage in RESCUE_STORAGE='$list'; use an ordered list of storage IDs with backup content, or add 'auto'" >&2
+  return 1
 }
 
 rescue_archive() {   # vzdump the CT to rescue storage before an approved teardown
