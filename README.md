@@ -351,6 +351,18 @@ Setup (desktop side, once):
    wiring needed) and reads the credentials the build already injected
    at `/root/.vibe/.env`: it comes up authenticated with no prompt, and
    shares sessions and the Vibe Code budget with the CLI.
+4. Once, stop reinstalling it by hand: add the extension's marketplace
+   ID to Remote-SSH's `remote.SSH.defaultExtensions` ("always installed
+   on any SSH host"), in the same desktop settings.json as step 1:
+
+   ```json
+   "remote.SSH.defaultExtensions": ["mistralai.mistral-vibe-code"]
+   ```
+
+   From then on the extension installs itself into the sandbox on
+   every connect, and the per-rebuild **Install in SSH** click below
+   disappears. (Remote-SSH fetches the Marketplace version; the `code`
+   CLI itself still has no switch for the remote slot.)
 
 ### One-command reconnect (desktop scripts)
 
@@ -388,16 +400,19 @@ What a run does:
 
 Overrides (env vars, defaults in the script headers): `PVE_SCRIPT`,
 `PVE_KEY`, `SSH_ALIAS`. The account at `PVE_HOST` must be able to read
-the managed sandbox key on the host (root by default). The Mistral Vibe
-extension remains one **Install in SSH** click per rebuild: the `code`
-CLI has no switch for installing into the remote extension host slot,
-only the Extensions view does.
+the managed sandbox key on the host (root by default). The extension
+side is pushable too: `remote.SSH.defaultExtensions` (desktop setup,
+step 4) makes every connect install `mistralai.mistral-vibe-code` into
+the sandbox; without it, the `code` CLI has no switch for the remote
+extension host slot and the Extensions view stays the only door.
 
 Per-rebuild tax: every `up`, `down`, or GUI Stop wipes the CT, and
 `vscode-server` and the extension install go with it. Reconnecting after
-a rebuild reinstalls the server, and the extension needs one
-**Install in SSH** click again. This is dev-tooling churn, not lost work:
-the lifecycle, the work guard, and the rescue archive are unaffected.
+a rebuild reinstalls the server, and the extension either reinstalls
+itself on connect (when listed in `remote.SSH.defaultExtensions`) or
+needs one **Install in SSH** click. This is dev-tooling churn, not lost
+work: the lifecycle, the work guard, and the rescue archive are
+unaffected.
 
 Tooling note: do not preinstall `vscode-server` in
 [`provision.sh`](#hooks); it self-installs on connect, version-matched to
@@ -591,9 +606,10 @@ with the refusal message in the task log rather than touching the CT.
 - The Mistral Vibe extension (or `vscode-server`) is gone from the SSH
   remote after a rebuild: expected, both live inside the CT and are wiped
   with it. Reconnect (the server reinstalls itself on connect, a minute
-  or two), then **Install in SSH: vibe-sandbox** for the extension again;
-  auth stays zero-touch because `/root/.vibe/.env` is re-injected on
-  every build. See
+  or two), then **Install in SSH: vibe-sandbox** for the extension again
+  (or list it in `remote.SSH.defaultExtensions` so the reinstall happens
+  on connect instead); auth stays zero-touch because `/root/.vibe/.env`
+  is re-injected on every build. See
   [Coding from the sandbox in VS Code (Remote-SSH)](#coding-from-the-sandbox-in-vs-code-remote-ssh).
 - `up`, `down`, `purge`, or a GUI Stop/Restart aborts with the **work
   guard**: the running sandbox holds git repos with uncommitted changes,
