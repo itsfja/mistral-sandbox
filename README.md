@@ -363,13 +363,23 @@ Setup (desktop side, once):
    every connect, and the per-rebuild **Install in SSH** click below
    disappears. (Remote-SSH fetches the Marketplace version; the `code`
    CLI itself still has no switch for the remote slot.)
+5. Optionally, preempt the one-time "select the platform of the remote
+   host" picker on a fresh desktop: pin the alias platform in the same
+   settings.json (or just answer the picker once; Remote-SSH saves the
+   answer per alias, so rebuilds never re-ask):
+
+   ```json
+   "remote.SSH.remotePlatform": { "vibe-sandbox": "linux" }
+   ```
 
 ### One-command reconnect (desktop scripts)
 
 The ssh side of the reconnect is scriptable. `vscode-connect.sh`
 (Linux/macOS) and `vscode-connect.ps1` (Windows) sit beside this script in
 the repo: they refresh the desktop ssh entry for the sandbox and open
-VS Code straight into the remote over the `code` CLI.
+VS Code straight into the remote over the `code` CLI. (Under the hood
+they run `code --folder-uri vscode-remote://ssh-remote+vibe-sandbox/<folder>`,
+which also works on its own once your ssh config block is current.)
 
 ```bash
 # Linux/macOS; PVE_HOST must be ssh-reachable from the desktop
