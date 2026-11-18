@@ -60,6 +60,18 @@
 #                      instead of being destroyed. The guard fails closed:
 #                      in GUI hooks, a refused check aborts the task.
 #
+#   * WORK-GUARDED:     no teardown silently incinerates unextracted work.
+#                      Before up/down/purge or a GUI Stop/Restart kills a
+#                      RUNNING sandbox, it is scanned for git repos holding
+#                      uncommitted changes, meaningful new files, or
+#                      commits not on any remote. Findings abort the
+#                      teardown (interactive default-No confirm;
+#                      fail-closed when unattended, e.g. cron) unless
+#                      FORCE=1. A pass is stamped in /run so the
+#                      hookscript's pre-stop, a separate PVE process
+#                      without the caller's environment, lets an
+#                      already-approved stop through.
+#
 #   * SELF-UPDATING:    the script is installed by hand, so local copies
 #                      drift silently — a bug fixed on main keeps biting a
 #                      stale copy (that is how #10 went unnoticed). Build
@@ -125,6 +137,9 @@ EXPORT_DIR="${EXPORT_DIR:-/root/vibe-sandbox-export}"     # desktop bundle outpu
 AUTO_UPDATE="${AUTO_UPDATE:-on}"        # on = build paths self-check against main; off = never check
 RAW_URL="${RAW_URL:-https://raw.githubusercontent.com/itsfja/mistral-sandbox/main/vibe-sandbox.sh}"
 LOCK_FILE="/run/lock/vibe-sandbox.lock"
+FORCE="${FORCE:-0}"                   # 1 = skip the work-loss guard entirely
+GUARD_STAMP="/run/lock/vibe-sandbox.workguard-ok"  # fresh pass lets the hook pre-stop through
+GUARD_STAMP_TTL=600                   # seconds a guard pass remains valid
 
 # --------------------------- helpers ---------------------------------------
 die() { echo "error: $*" >&2; exit 1; }
@@ -293,6 +308,75 @@ wait_for_ip() {
   return 1
 }
 
+# --------------------------- work-loss guard ----------------------------------
+# "Disposable" must never silently mean "destroys your unpushed commits".
+# Every teardown that kills a RUNNING sandbox (up / down / purge, GUI Stop
+# or Restart via the hookscript) first scans it for git repos holding work
+# that exists nowhere outside the CT: modified or staged files, meaningful
+# new files, or commits not on any remote. Findings abort the teardown —
+# interactive default-No confirm, fail-closed when unattended — unless
+# FORCE=1. A pass is stamped in /run: the hookscript's pre-stop runs as a
+# separate PVE process WITHOUT the caller's environment, so a fresh stamp
+# is the only way it can know an interactive guard already said yes.
+
+sandbox_work_findings() {   # echoes findings for a running CT; empty = clean
+  ct_running || return 0
+  pct exec "$CTID" -- bash -c '
+    command -v git >/dev/null 2>&1 || exit 0
+    find /root /home -maxdepth 4 -type d -name .git 2>/dev/null |
+    while IFS= read -r g; do
+      repo="${g%/.git}"
+      cd "$repo" 2>/dev/null || continue
+      dirty="$(git status --porcelain 2>/dev/null | grep -cv "^??")"
+      new="$(git status --porcelain 2>/dev/null | grep "^??" |
+        grep -cvE "(\.pytest_cache|__pycache__|node_modules|\.venv|\.mypy_cache|\.ruff_cache|/dist/|/build/|\.DS_Store)")"
+      unpushed="$(git rev-list --count --all --not --remotes 2>/dev/null)" ||
+        unpushed=0
+      [ "${dirty:-0}" -gt 0 ] || [ "${new:-0}" -gt 0 ] ||
+        [ "${unpushed:-0}" -gt 0 ] || continue
+      printf "  %s: %s modified, %s new, %s unpushed\n" \
+        "$repo" "$dirty" "$new" "$unpushed"
+    done
+  ' 2>/dev/null
+}
+
+guard_stamp_ok() {   # true when the last guard pass is fresher than the TTL
+  [ -f "$GUARD_STAMP" ] || return 1
+  local age
+  age="$(( $(date +%s) - $(stat -c %Y "$GUARD_STAMP" 2>/dev/null || echo 0) ))"
+  [ "$age" -le "$GUARD_STAMP_TTL" ]
+}
+
+work_guard() {   # $1 = teardown label (up|down|purge|pre-stop); fail-closed
+  local findings ans label="${1:-teardown}"
+  if [ "$FORCE" = "1" ] || guard_stamp_ok; then
+    touch "$GUARD_STAMP" 2>/dev/null || true
+    return 0
+  fi
+  findings="$(sandbox_work_findings)"
+  if [ -z "$findings" ]; then
+    touch "$GUARD_STAMP" 2>/dev/null || true
+    return 0
+  fi
+  echo "work guard ($label): the sandbox holds work that exists nowhere else:" >&2
+  echo "$findings" >&2
+  if [ -t 0 ] && [ -t 1 ]; then
+    read -r -p "tearing it down will PERMANENTLY lose it. Proceed? [y/N] " ans
+    case "$ans" in
+      y | Y | yes | Yes | YES)
+        touch "$GUARD_STAMP" 2>/dev/null || true
+        return 0
+        ;;
+      *)
+        echo "aborted: push or extract the work, or re-run with FORCE=1" >&2
+        return 1
+        ;;
+    esac
+  fi
+  echo "no terminal attached: aborting $label (push/extract, or FORCE=1)" >&2
+  return 1
+}
+
 # Ownership interlock: EVERY destructive operation must pass this gate.
 # The sandbox is identified by BOTH the sandbox hostname AND the ownership
 # tag on the CT config. A same-ID collision — some other system squatting
@@ -319,6 +403,7 @@ guard_ct() {
 
 destroy_sandbox() {
   guard_ct   # ownership interlock: never destroy a CT that is not ours
+  work_guard destroy || die "work guard: refusing to destroy CT $CTID"
   if ct_exists; then
     ct_running && pct stop "$CTID"
     pct destroy "$CTID" --purge
@@ -521,6 +606,7 @@ cmd_up() {
 cmd_down() {
   lock_or_die
   [ "$EUID" -eq 0 ] || die "must run as root on the Proxmox host"
+  work_guard down || die "work guard: refusing to park CT $CTID"
   park_sandbox
   echo "sandbox parked: disk clobbered (CLOBBER=$CLOBBER), fresh stub at CT $CTID."
   echo "  right-click Start in the Proxmox GUI, or run 'up', for the next session."
@@ -528,6 +614,7 @@ cmd_down() {
 
 cmd_purge() {
   lock_or_die
+  work_guard purge || die "work guard: refusing to purge CT $CTID"
   ct_running && pct stop "$CTID"
   destroy_sandbox
   echo "CT $CTID removed entirely (no stub left in the tree)."
@@ -671,7 +758,7 @@ EOF
 # (vmid, phase); the shim execs this. Phases:
 #   pre-start  — destroy + recreate fresh, stopped; PVE then boots the NEW CT
 #   post-start — wait for IP, provision, log the ssh line
-#   pre-stop   — no-op (PVE handles the stop)
+#   pre-stop   — work guard: refuse stops that would lose unextracted work
 #   post-stop  — clobber + park stub
 # All destructive phases go through guard_ct(): if the CT at $CTID is not
 # provably ours, the hook ABORTS the GUI task instead of touching it.
@@ -704,7 +791,12 @@ cmd_hook() {
       print_ssh_line "$ip"
       ;;
     pre-stop)
-      : ;;
+      # Last moment the sandbox is alive: GUI Stop/Restart cannot
+      # prompt, so findings abort the stop (PVE aborts the action when a
+      # hookscript exits non-zero) unless a CLI guard pass was stamped
+      # moments ago. Read-only; never blocks a clean sandbox.
+      work_guard pre-stop || die "work guard: refusing to stop CT $CTID with unextracted work"
+      ;;
     post-stop)
       hook_lock "$phase" || exit 0
       park_sandbox
