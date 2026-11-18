@@ -144,7 +144,7 @@ FORCE="${FORCE:-0}"                   # 1 = skip the work-loss guard entirely
 GUARD_STAMP="/run/lock/vibe-sandbox.workguard-ok"  # fresh pass lets the hook pre-stop through
 GUARD_STAMP_TTL=600                   # seconds a guard pass remains valid
 RESCUE="${RESCUE:-1}"                 # 1 = before an approved guarded teardown, vzdump the CT to rescue storage
-RESCUE_STORAGE="${RESCUE_STORAGE:-}"  # backup storage for rescue archives; auto-detected when empty
+RESCUE_STORAGE="${RESCUE_STORAGE:-unraid-lvm}"  # backup storage for rescue archives; "auto" = first storage with backup content
 RESCUE_KEEP="${RESCUE_KEEP:-2}"       # rescue archives of this CT to keep on the storage
 STORAGE_CFG="${STORAGE_CFG:-/etc/pve/storage.cfg}"  # storage definitions (content/path lookup)
 
@@ -354,8 +354,9 @@ storage_cfg_value() {   # $1 = storage name, $2 = key (content|path) from $STORA
   ' "$STORAGE_CFG" 2>/dev/null
 }
 
-rescue_storage() {   # rescue backup storage: explicit RESCUE_STORAGE, else auto
+rescue_storage() {   # rescue backup storage: pinned (default), explicit, or auto
   local pick contents
+  [ "$RESCUE_STORAGE" = "auto" ] && RESCUE_STORAGE=""
   if [ -n "$RESCUE_STORAGE" ]; then
     contents="$(storage_cfg_value "$RESCUE_STORAGE" content)"
     case ",${contents}," in
