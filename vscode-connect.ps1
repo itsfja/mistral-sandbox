@@ -43,7 +43,7 @@ function Probe {
 
 function Launch {
   Note "opening VS Code in ssh-remote+$SshAlias$Workspace ..."
-  Note "first connect after a rebuild: Remote-SSH downloads vscode-server, then install the Mistral Vibe extension with 'Install in SSH: $SshAlias'."
+  Note "first connect after a rebuild downloads vscode-server; the Mistral Vibe extension reinstalls itself when listed in remote.SSH.defaultExtensions (README: desktop setup, step 4), else one 'Install in SSH: $SshAlias' click."
   code --folder-uri "vscode-remote://ssh-remote+$SshAlias$Workspace"
   exit $LASTEXITCODE
 }

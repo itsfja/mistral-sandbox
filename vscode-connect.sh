@@ -26,8 +26,10 @@
 #      once if missing, and wait for ssh to come good.
 #   3. Open VS Code in the remote: code --folder-uri
 #      vscode-remote://ssh-remote+vibe-sandbox/<workspace>
-# The Mistral Vibe extension is still one 'Install in SSH' click per
-# rebuild: the CLI has no switch for installing into the remote slot.
+# Extension push: "remote.SSH.defaultExtensions":
+#   ["mistralai.mistral-vibe-code"] in desktop settings.json makes
+#   Remote-SSH install the Mistral Vibe extension into the sandbox on
+#   every connect (the code CLI has no switch for the remote slot).
 
 set -euo pipefail
 
@@ -48,7 +50,7 @@ note() { echo "vscode-connect: $*"; }
 
 launch() {
   note "opening VS Code in ssh-remote+${SSH_ALIAS}${WORKSPACE} ..."
-  note "first connect after a rebuild: Remote-SSH downloads vscode-server, then install the Mistral Vibe extension with 'Install in SSH: $SSH_ALIAS'."
+  note "first connect after a rebuild downloads vscode-server; the Mistral Vibe extension reinstalls itself when listed in remote.SSH.defaultExtensions (README: desktop setup, step 4), else one 'Install in SSH: $SSH_ALIAS' click."
   exec code --folder-uri "vscode-remote://ssh-remote+${SSH_ALIAS}${WORKSPACE}"
 }
 
