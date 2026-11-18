@@ -217,7 +217,9 @@ key, switch presets with `/model`. The `Invalid API key` entry in
 Troubleshooting covers the full story.
 
 Or work from your desktop instead of the host: see
-[From your desktop (export)](#from-your-desktop-export) below.
+[From your desktop (export)](#from-your-desktop-export) below. For a full
+editor GUI over the sandbox, see
+[Coding from the sandbox in VS Code (Remote-SSH)](#coding-from-the-sandbox-in-vs-code-remote-ssh).
 
 Other doors in and out:
 
@@ -318,6 +320,65 @@ Notes:
   and on your desktop. That is the point of the feature, but it means the
   key no longer lives only on the host — delete the export dir after
   fetching the tarball (the bundle README says how).
+
+## Coding from the sandbox in VS Code (Remote-SSH)
+
+The exported `ssh vibe-sandbox` alias (see
+[From your desktop (export)](#from-your-desktop-export)) also works as a
+VS Code remote: the editor UI runs on your desktop, the
+[Remote - SSH](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-ssh)
+extension connects through the same pinned ssh config (rebuild host-key
+rotation is already covered by the pin), and the
+[Mistral Vibe extension](https://docs.mistral.ai/vibe/code/vs-code-extension/install-authenticate)
+runs its agent inside the container over the same credentials as the CLI.
+Nothing new is provisioned by this script and nothing persists:
+`vscode-server` and the extension install live inside the CT and die with
+every rebuild, by design.
+
+Setup (desktop side, once):
+
+1. Set `remote.autoForwardPorts` to `false` in your VS Code settings
+   **before the first connect**. By default, any port a process inside
+   the sandbox listens on is forwarded to `localhost` on the desktop,
+   where browsers sometimes hand out implicit trust to localhost
+   listeners; turning it off keeps sandboxed processes off your desktop
+   loopback.
+2. **Remote-SSH: Connect to Host**, pick `vibe-sandbox`. The first
+   connect installs `vscode-server` into the CT (a minute or two: it
+   downloads itself, version-matched to your desktop VS Code).
+3. In the Extensions view, install **Mistral Vibe** with
+   **Install in SSH: vibe-sandbox**. It bundles its own agent (no CLI
+   wiring needed) and reads the credentials the build already injected
+   at `/root/.vibe/.env`: it comes up authenticated with no prompt, and
+   shares sessions and the Vibe Code budget with the CLI.
+
+Per-rebuild tax: every `up`, `down`, or GUI Stop wipes the CT, and
+`vscode-server` and the extension install go with it. Reconnecting after
+a rebuild reinstalls the server, and the extension needs one
+**Install in SSH** click again. This is dev-tooling churn, not lost work:
+the lifecycle, the work guard, and the rescue archive are unaffected.
+
+Tooling note: do not preinstall `vscode-server` in
+[`provision.sh`](#hooks); it self-installs on connect, version-matched to
+your desktop editor, and base provisioning stays what it is. The same
+goes for session-acquired tooling in general (say, a test runner pulled
+in by a repo you were testing): it is not part of the base image and
+does not survive a rebuild. Anything every session genuinely needs goes
+in `provision.sh` (toolchains, repo clones), not in the base image.
+
+Security habits, restated for the remote path:
+
+- The ingress is unchanged: ssh from the desktop is the only door, and
+  nothing here adds a LAN listener. Never expose CT services to the LAN
+  to work around friction.
+- Keep the remote workspace **untrusted** unless a task truly needs
+  trust, and decline extension installs that workspace content
+  recommends.
+- Read shell-command approvals before allowing them; never adopt an
+  always-allow option if the extension offers one.
+- `down` when you are done for the day: along with everything else, it
+  closes the remote session's foothold. Never leave a connected, idle
+  VS Code remote session running overnight against a live sandbox.
 
 ## GUI-driven lifecycle (Proxmox right-click)
 
@@ -486,6 +547,13 @@ with the refusal message in the task log rather than touching the CT.
   host store (`printf 'MISTRAL_API_KEY=<new-key>\n' > /root/.vibe-sandbox.env`)
   and run `up` again. `/whoami` should then show the paid plan and
   `Key scope: vibe`.
+- The Mistral Vibe extension (or `vscode-server`) is gone from the SSH
+  remote after a rebuild: expected, both live inside the CT and are wiped
+  with it. Reconnect (the server reinstalls itself on connect, a minute
+  or two), then **Install in SSH: vibe-sandbox** for the extension again;
+  auth stays zero-touch because `/root/.vibe/.env` is re-injected on
+  every build. See
+  [Coding from the sandbox in VS Code (Remote-SSH)](#coding-from-the-sandbox-in-vs-code-remote-ssh).
 - `up`, `down`, `purge`, or a GUI Stop/Restart aborts with the **work
   guard**: the running sandbox holds git repos with uncommitted changes,
   new files, or commits not on any remote, and tearing it down would
