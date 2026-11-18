@@ -352,6 +352,47 @@ Setup (desktop side, once):
    at `/root/.vibe/.env`: it comes up authenticated with no prompt, and
    shares sessions and the Vibe Code budget with the CLI.
 
+### One-command reconnect (desktop scripts)
+
+The ssh side of the reconnect is scriptable. `vscode-connect.sh`
+(Linux/macOS) and `vscode-connect.ps1` (Windows) sit beside this script in
+the repo: they refresh the desktop ssh entry for the sandbox and open
+VS Code straight into the remote over the `code` CLI.
+
+```bash
+# Linux/macOS; PVE_HOST must be ssh-reachable from the desktop
+PVE_HOST=root@192.168.3.188 bash vscode-connect.sh              # opens /root
+PVE_HOST=root@192.168.3.188 bash vscode-connect.sh /root/work   # another folder
+```
+
+```powershell
+# Windows (PowerShell; ssh/scp are built in from Windows 10)
+$env:PVE_HOST = 'root@192.168.3.188'
+.\vscode-connect.ps1
+```
+
+What a run does:
+
+- Fast path: tries `ssh vibe-sandbox` as-is first; if it works (say, a
+  DHCP reservation is pinning the IP), the Proxmox host is never even
+  contacted.
+- Stale path (a rebuild changed the IP): fetches the current IP from
+  `$PVE_HOST` (`vibe-sandbox.sh ip`), rewrites **only** its marked
+  `# BEGIN/END vibe-sandbox` block in your ssh config (a legacy
+  unmarked `Host vibe-sandbox` block from the manual export flow is
+  replaced; every other host entry is untouched), fetches the permanent
+  private key once if it is missing, waits for ssh to come good, then
+  opens `code --folder-uri vscode-remote://ssh-remote+vibe-sandbox/root`.
+- The keypair is permanent, so after the first run nothing is fetched
+  again: only the `HostName` line ever changes between rebuilds.
+
+Overrides (env vars, defaults in the script headers): `PVE_SCRIPT`,
+`PVE_KEY`, `SSH_ALIAS`. The account at `PVE_HOST` must be able to read
+the managed sandbox key on the host (root by default). The Mistral Vibe
+extension remains one **Install in SSH** click per rebuild: the `code`
+CLI has no switch for installing into the remote extension host slot,
+only the Extensions view does.
+
 Per-rebuild tax: every `up`, `down`, or GUI Stop wipes the CT, and
 `vscode-server` and the extension install go with it. Reconnecting after
 a rebuild reinstalls the server, and the extension needs one
