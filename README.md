@@ -55,9 +55,9 @@ outbound internet access — without handing it your machine.
   the teardown (interactive default-No confirm; fail-closed when
   unattended, e.g. cron) unless `FORCE=1`. An approved teardown is
   rescue-archived first: the whole CT is dumped with `vzdump` to backup
-  storage (`RESCUE_STORAGE`, defaulting to `unraid-lvm` on the NAS;
-  `auto` picks the first storage with backup content in
-  `/etc/pve/storage.cfg`),
+  storage (`RESCUE_STORAGE`: a comma-separated preference list checked
+  in order; `auto` = the first storage with backup content in
+  `/etc/pve/storage.cfg`; default `unraid-lvm,auto`),
   keeping the last `RESCUE_KEEP` archives, so an approved destruction is
   still recoverable; a failed archive aborts with nothing destroyed.
   `RESCUE=0` skips the archive.
@@ -492,9 +492,10 @@ with the refusal message in the task log rather than touching the CT.
   permanently lose them. Push or extract the work, then re-run;
   `FORCE=1 <command>` proceeds without prompting (a rescue archive is
   still taken first when work is found). On approval, the whole CT is
-  archived with `vzdump` to the storage named in `RESCUE_STORAGE`
-  (default `unraid-lvm`; `auto` picks the first storage with backup
-  content in `/etc/pve/storage.cfg`); only the last
+  archived with `vzdump` to the first usable entry of `RESCUE_STORAGE`
+  (a comma-separated preference list, checked in order; default
+  `unraid-lvm,auto`; an entry without backup content in
+  `/etc/pve/storage.cfg` is skipped); only the last
   `RESCUE_KEEP` archives are kept. If the archive fails, nothing is
   destroyed. Recover one with `pct restore 1042 <archive>`, or extract
   files straight out of the tar. GUI
@@ -579,9 +580,9 @@ not reachable from your desktop),
 `FORCE` (`1`: proceed through the work guard without prompting; a
 rescue archive is still taken first when work is found),
 `RESCUE` (`1`/`0`: take the pre-teardown rescue archive; default `1`),
-`RESCUE_STORAGE` (backup storage for rescue archives; default
-`unraid-lvm`, or `auto` to detect the first storage with backup
-content), `RESCUE_KEEP` (rescue
+`RESCUE_STORAGE` (comma-separated preference list of rescue backup
+storages, checked in order; `auto` = the first storage with backup
+content; default `unraid-lvm,auto`), `RESCUE_KEEP` (rescue
 archives of this CT to retain; default `2`), and
 `RAW_URL` (where the self-check fetches the current script from).
 
