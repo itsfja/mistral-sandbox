@@ -228,7 +228,9 @@ writes a desktop bundle to `/root/vibe-sandbox-export` (overridable:
 (`ssh vibe-sandbox`), and a README.txt with per-OS instructions
 (Linux/macOS, Windows built-in OpenSSH, and a PuTTY `.ppk` conversion).
 It prints the `scp` command to fetch the tarball from your desktop
-(host SSH must be reachable from your LAN), then:
+(host SSH must be reachable from your LAN; on multi-homed hosts the
+printed address is the first from `hostname -I` — override it with
+`HOST_IP=<reachable-address>`), then:
 
 ```text
 mkdir -p ~/.ssh && chmod 700 ~/.ssh          # Linux/macOS
@@ -275,6 +277,13 @@ Notes:
   re-run `export`, or avoid it entirely with the DHCP reservation above
   (the MAC it binds is retained across rebuilds, so the reservation holds
   forever).
+- **Rebuilds mint fresh SSH host keys**: every `up` creates new host
+  keys, so strict host-key checking would block the second rebuild's
+  connect. The bundled `ssh-config` snippet pins
+  `StrictHostKeyChecking no` for the sandbox Host only (nothing else
+  shares the alias); with a hand-rolled config, expect `REMOTE HOST
+  IDENTIFICATION HAS CHANGED` after each rebuild, and clear it with
+  `ssh-keygen -R <ip>`.
 - `export` requires a running sandbox (it embeds the current IP) and the
   managed keypair; with an `SSH_PUBKEY` override, export your own key
   yourself — the script will not copy keys it does not manage.
@@ -420,6 +429,16 @@ with the refusal message in the task log rather than touching the CT.
   universally-administered MAC:
   `printf 'xx:xx:xx:xx:xx:xx\n' > /root/.vibe-sandbox.mac` (or
   `CT_MAC=...` per command).
+- `ssh vibe-sandbox` from the desktop fails after a rebuild with
+  `REMOTE HOST IDENTIFICATION HAS CHANGED` — expected: every rebuild
+  mints a fresh SSH host key (the sandbox's real identity is the
+  permanent keypair). The bundled ssh-config pins
+  `StrictHostKeyChecking no` for this one Host, so this only bites
+  hand-rolled configs; recover with `ssh-keygen -R <ip>` and reconnect.
+- `export`'s scp line points at an unreachable address — the scp hint
+  defaults to the first address from `hostname -I`; on multi-homed
+  hosts that may not be your LAN address. Rerun with
+  `HOST_IP=<reachable-address> /root/vibe-sandbox.sh export`.
 
 ## Subcommands
 
@@ -490,7 +509,10 @@ retained MAC lives), `CT_MAC` (pin a specific MAC instead of the managed
 one), `SECRETS_FILE`, `HOOK` (`on`/`off`: GUI lifecycle trapping),
 `CLOBBER` (`discard`/`zero`/`off`: post-stop rootfs wipe), `SANDBOX_TAG`
 (ownership tag enforced by the guard before any destroy or wipe),
-`EXPORT_DIR` (where the desktop bundle is written),
+`EXPORT_DIR` (where the desktop bundle is written), `HOST_IP` (the host
+address export prints in its scp hint — defaults to the first address
+from `hostname -I`; set it on multi-homed hosts where that address is
+not reachable from your desktop),
 `AUTO_UPDATE` (`on`/`off`: build-path self-check against main), and
 `RAW_URL` (where the self-check fetches the current script from).
 
