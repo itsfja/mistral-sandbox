@@ -53,7 +53,12 @@ outbound internet access — without handing it your machine.
   sandbox, it is scanned for git repos with uncommitted changes,
   meaningful new files, or commits not on any remote. Findings abort
   the teardown (interactive default-No confirm; fail-closed when
-  unattended, e.g. cron) unless `FORCE=1`.
+  unattended, e.g. cron) unless `FORCE=1`. An approved teardown is
+  rescue-archived first: the whole CT is dumped with `vzdump` to backup
+  storage (auto-detected from `pvesm status`, or `RESCUE_STORAGE`),
+  keeping the last `RESCUE_KEEP` archives, so an approved destruction is
+  still recoverable; a failed archive aborts with nothing destroyed.
+  `RESCUE=0` skips the archive.
 - **Self-updating** — the script is installed by hand, so local copies
   drift; build paths (`up`, GUI Start) sha256-check against the copy on
   `main`, auto-install the current version (previous copy kept beside
@@ -483,7 +488,13 @@ with the refusal message in the task log rather than touching the CT.
   guard**: the running sandbox holds git repos with uncommitted changes,
   new files, or commits not on any remote, and tearing it down would
   permanently lose them. Push or extract the work, then re-run;
-  `FORCE=1 <command>` skips the guard when you really mean it. GUI
+  `FORCE=1 <command>` proceeds without prompting (a rescue archive is
+  still taken first when work is found). On approval, the whole CT is
+  archived with `vzdump` to the first backup-capable storage
+  (`pvesm status`), or the one named in `RESCUE_STORAGE`; only the last
+  `RESCUE_KEEP` archives are kept. If the archive fails, nothing is
+  destroyed. Recover one with `pct restore 1042 <archive>`, or extract
+  files straight out of the tar. GUI
   refusals appear in the PVE task log (the hookscript cannot prompt);
   an unattended cron rebuild fails closed the same way, naming the
   repos in its log.
@@ -562,7 +573,12 @@ address export prints in its scp hint — defaults to the first address
 from `hostname -I`; set it on multi-homed hosts where that address is
 not reachable from your desktop),
 `AUTO_UPDATE` (`on`/`off`: build-path self-check against main),
-`FORCE` (`1`: skip the work guard entirely), and
+`FORCE` (`1`: proceed through the work guard without prompting; a
+rescue archive is still taken first when work is found),
+`RESCUE` (`1`/`0`: take the pre-teardown rescue archive; default `1`),
+`RESCUE_STORAGE` (backup storage for rescue archives; auto-detected as
+the first backup-capable storage when unset), `RESCUE_KEEP` (rescue
+archives of this CT to retain; default `2`), and
 `RAW_URL` (where the self-check fetches the current script from).
 
 ## Hooks

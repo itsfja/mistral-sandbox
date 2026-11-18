@@ -67,7 +67,10 @@
 #                      commits not on any remote. Findings abort the
 #                      teardown (interactive default-No confirm;
 #                      fail-closed when unattended, e.g. cron) unless
-#                      FORCE=1. A pass is stamped in /run so the
+#                      FORCE=1. An approved teardown is first rescue-
+#                      archived to backup storage (vzdump, keeping the
+#                      last RESCUE_KEEP copies; RESCUE=0 skips the
+#                      archive). A pass is stamped in /run so the
 #                      hookscript's pre-stop, a separate PVE process
 #                      without the caller's environment, lets an
 #                      already-approved stop through.
@@ -140,6 +143,9 @@ LOCK_FILE="/run/lock/vibe-sandbox.lock"
 FORCE="${FORCE:-0}"                   # 1 = skip the work-loss guard entirely
 GUARD_STAMP="/run/lock/vibe-sandbox.workguard-ok"  # fresh pass lets the hook pre-stop through
 GUARD_STAMP_TTL=600                   # seconds a guard pass remains valid
+RESCUE="${RESCUE:-1}"                 # 1 = before an approved guarded teardown, vzdump the CT to rescue storage
+RESCUE_STORAGE="${RESCUE_STORAGE:-}"  # backup storage for rescue archives; auto-detected when empty
+RESCUE_KEEP="${RESCUE_KEEP:-2}"       # rescue archives of this CT to keep on the storage
 
 # --------------------------- helpers ---------------------------------------
 die() { echo "error: $*" >&2; exit 1; }
@@ -340,6 +346,52 @@ sandbox_work_findings() {   # echoes findings for a running CT; empty = clean
   ' 2>/dev/null
 }
 
+rescue_storage() {   # rescue backup storage: explicit RESCUE_STORAGE, else auto
+  if [ -n "$RESCUE_STORAGE" ]; then
+    if pvesm status | awk -v s="$RESCUE_STORAGE" '$1 == s && /backup/ {ok = 1} END {exit !ok}'; then
+      echo "$RESCUE_STORAGE"
+      return 0
+    fi
+    echo "rescue: RESCUE_STORAGE '$RESCUE_STORAGE' has no backup content (pvesm status)" >&2
+    return 1
+  fi
+  local pick
+  pick="$(pvesm status 2>/dev/null | awk '$1 != "local" && $1 != "Name" && /backup/ {print $1; exit}')"
+  if [ -z "$pick" ]; then
+    echo "rescue: no backup-capable storage found (pvesm status); add one or set RESCUE_STORAGE" >&2
+    return 1
+  fi
+  echo "$pick"
+}
+
+rescue_archive() {   # vzdump the CT to rescue storage before an approved teardown
+  [ "$RESCUE" = "1" ] || {
+    echo "rescue: RESCUE=0 - proceeding without an archive" >&2
+    return 0
+  }
+  ct_exists || return 0
+  local storage out archive path dumpdir old
+  storage="$(rescue_storage)" || return 1
+  echo "rescue: archiving CT $CTID to '$storage' before teardown ..."
+  if ! out="$(vzdump "$CTID" --mode stop --storage "$storage" --compress zstd 2>&1)"; then
+    echo "$out" >&2
+    echo "rescue: vzdump failed - nothing was destroyed" >&2
+    return 1
+  fi
+  archive="$(printf '%s\n' "$out" | sed -n "s/.*creating vzdump archive '\([^']*\)'.*/\1/p" | head -n 1)"
+  echo "rescue: archive created${archive:+: $archive}"
+  # retention: keep only the newest RESCUE_KEEP archives of this CT
+  path="$(pvesm config "$storage" 2>/dev/null | awk '/^path:?/ {print $2; exit}')"
+  [ -n "$path" ] || return 0   # e.g. PBS storage manages its own retention
+  dumpdir="$path/dump"
+  ls -1t "$dumpdir"/vzdump-lxc-"$CTID"-*.tar.* 2>/dev/null |
+    tail -n +"$((RESCUE_KEEP + 1))" |
+    while read -r old; do
+      rm -f "$old" "${old%.tar.*}.log"
+      echo "rescue: pruned old archive $(basename "$old")"
+    done
+}
+
 guard_stamp_ok() {   # true when the last guard pass is fresher than the TTL
   [ -f "$GUARD_STAMP" ] || return 1
   local age
@@ -349,7 +401,7 @@ guard_stamp_ok() {   # true when the last guard pass is fresher than the TTL
 
 work_guard() {   # $1 = teardown label (up|down|purge|pre-stop); fail-closed
   local findings ans label="${1:-teardown}"
-  if [ "$FORCE" = "1" ] || guard_stamp_ok; then
+  if guard_stamp_ok; then
     touch "$GUARD_STAMP" 2>/dev/null || true
     return 0
   fi
@@ -360,21 +412,29 @@ work_guard() {   # $1 = teardown label (up|down|purge|pre-stop); fail-closed
   fi
   echo "work guard ($label): the sandbox holds work that exists nowhere else:" >&2
   echo "$findings" >&2
-  if [ -t 0 ] && [ -t 1 ]; then
-    read -r -p "tearing it down will PERMANENTLY lose it. Proceed? [y/N] " ans
+  if [ "$FORCE" = "1" ]; then
+    echo "work guard ($label): FORCE=1 - rescue-archiving, then proceeding" >&2
+  elif [ -t 0 ] && [ -t 1 ]; then
+    read -r -p "tearing it down loses it. Rescue-archive it first, then proceed? [y/N] " ans
     case "$ans" in
-      y | Y | yes | Yes | YES)
-        touch "$GUARD_STAMP" 2>/dev/null || true
-        return 0
-        ;;
+      y | Y | yes | Yes | YES) ;;
       *)
         echo "aborted: push or extract the work, or re-run with FORCE=1" >&2
         return 1
         ;;
     esac
+  else
+    echo "no terminal attached: aborting $label (push/extract, or FORCE=1)" >&2
+    return 1
   fi
-  echo "no terminal attached: aborting $label (push/extract, or FORCE=1)" >&2
-  return 1
+  # Approval given. Stamp BEFORE vzdump: its stop-mode stop triggers the
+  # pre-stop hook, which must see a fresh stamp to let the backup's stop through.
+  touch "$GUARD_STAMP" 2>/dev/null || true
+  if ! rescue_archive; then
+    rm -f "$GUARD_STAMP" 2>/dev/null || true
+    die "work guard: rescue archive failed - nothing was destroyed. Fix backup storage (RESCUE_STORAGE), or RESCUE=0 to destroy without an archive"
+  fi
+  return 0
 }
 
 # Ownership interlock: EVERY destructive operation must pass this gate.
