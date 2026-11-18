@@ -48,6 +48,12 @@ outbound internet access — without handing it your machine.
   hostname. A same-ID collision — another system squatting on the CTID,
   by design or by operator error — aborts loudly instead of being
   destroyed. In the GUI, a refused check aborts the task: it fails closed.
+- **Work-guarded** — no teardown silently incinerates unextracted work:
+  before `up`, `down`, `purge`, or a GUI Stop/Restart kills a running
+  sandbox, it is scanned for git repos with uncommitted changes,
+  meaningful new files, or commits not on any remote. Findings abort
+  the teardown (interactive default-No confirm; fail-closed when
+  unattended, e.g. cron) unless `FORCE=1`.
 - **Self-updating** — the script is installed by hand, so local copies
   drift; build paths (`up`, GUI Start) sha256-check against the copy on
   `main`, auto-install the current version (previous copy kept beside
@@ -473,6 +479,14 @@ with the refusal message in the task log rather than touching the CT.
   host store (`printf 'MISTRAL_API_KEY=<new-key>\n' > /root/.vibe-sandbox.env`)
   and run `up` again. `/whoami` should then show the paid plan and
   `Key scope: vibe`.
+- `up`, `down`, `purge`, or a GUI Stop/Restart aborts with the **work
+  guard**: the running sandbox holds git repos with uncommitted changes,
+  new files, or commits not on any remote, and tearing it down would
+  permanently lose them. Push or extract the work, then re-run;
+  `FORCE=1 <command>` skips the guard when you really mean it. GUI
+  refusals appear in the PVE task log (the hookscript cannot prompt);
+  an unattended cron rebuild fails closed the same way, naming the
+  repos in its log.
 
 ## Subcommands
 
@@ -547,7 +561,8 @@ one), `SECRETS_FILE`, `HOOK` (`on`/`off`: GUI lifecycle trapping),
 address export prints in its scp hint — defaults to the first address
 from `hostname -I`; set it on multi-homed hosts where that address is
 not reachable from your desktop),
-`AUTO_UPDATE` (`on`/`off`: build-path self-check against main), and
+`AUTO_UPDATE` (`on`/`off`: build-path self-check against main),
+`FORCE` (`1`: skip the work guard entirely), and
 `RAW_URL` (where the self-check fetches the current script from).
 
 ## Hooks
