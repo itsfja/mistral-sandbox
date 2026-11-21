@@ -85,6 +85,23 @@
 #                      a warning when it cannot run. AUTO_UPDATE=off
 #                      disables; `update` does it explicitly.
 #
+#   * CONNECTOR-HARDENED: every rebuild injects a hardened /root/.vibe/config.toml
+#                      (mode 400) disabling Vibe connectors (VIBE_CONNECTORS=off),
+#                      MCP servers (VIBE_MCP=off), and auto-approve/YOLO bypass
+#                      (VIBE_AUTO_APPROVE=off) by default. VIBE_HARDEN=off skips
+#                      config injection. Account-level Vibe Work connectors live
+#                      outside the CT and must also be disabled per-chat (README).
+#
+#   * EGRESS-FIREWALLED: with FIREWALL=on (default), net0 is attached with
+#                      firewall=1 and a host-side PVE ruleset is written to
+#                      /etc/pve/firewall/<CTID>.fw (outside container root
+#                      control). Default EGRESS_POLICY=lan-block allows inbound
+#                      SSH + outbound DHCP/DNS/internet while dropping outbound
+#                      RFC1918 LAN, link-local/metadata, CGNAT, and IPv6 ULA;
+#                      EGRESS_POLICY=strict sets policy_out=DROP with explicit
+#                      EGRESS_ALLOW CIDRs/IPs; EGRESS_POLICY=off disables.
+#                      Enforced when Proxmox Datacenter firewall is enabled.
+#
 # Run ON the Proxmox host as root (uses `pct` / `pveam` / `pvesm`).
 # Tested syntax: PVE 8.x. Review flags against your version before first run.
 #
@@ -147,6 +164,14 @@ RESCUE="${RESCUE:-1}"                 # 1 = before an approved guarded teardown,
 RESCUE_STORAGE="${RESCUE_STORAGE:-unraid-lvm,auto}"  # rescue backup storages in preference order; "auto" = first with backup content
 RESCUE_KEEP="${RESCUE_KEEP:-2}"       # rescue archives of this CT to keep on the storage
 STORAGE_CFG="${STORAGE_CFG:-/etc/pve/storage.cfg}"  # storage definitions (content/path lookup)
+VIBE_HARDEN="${VIBE_HARDEN:-on}"      # on = inject hardened /root/.vibe/config.toml; off = skip
+VIBE_CONNECTORS="${VIBE_CONNECTORS:-off}"       # off = disable Vibe connectors; on = allow
+VIBE_MCP="${VIBE_MCP:-off}"                     # off = disable MCP servers; on = allow
+VIBE_AUTO_APPROVE="${VIBE_AUTO_APPROVE:-off}"   # off = disable auto-approve/YOLO; on = allow
+FIREWALL="${FIREWALL:-on}"            # on = attach PVE firewall=1 and write per-CT rules; off = skip
+EGRESS_POLICY="${EGRESS_POLICY:-lan-block}"     # lan-block | strict | off
+EGRESS_ALLOW="${EGRESS_ALLOW:-}"      # optional comma-separated IPs/CIDRs allowed outbound
+FW_DIR="${FW_DIR:-/etc/pve/firewall}" # Proxmox firewall config dir (contains cluster.fw & <CTID>.fw)
 
 # --------------------------- helpers ---------------------------------------
 die() { echo "error: $*" >&2; exit 1; }
@@ -515,20 +540,247 @@ destroy_sandbox() {
   fi
 }
 
+# --------------------------- connector & egress hardening --------------------
+# Isolating compute/filesystem does not contain information flow if outbound
+# connectors are enabled or if the CT can probe/reach internal LAN services.
+# Layer 1 (in-CT guardrail): deterministic /root/.vibe/config.toml disabling
+# connectors, MCP servers, and auto-approve by default.
+# Layer 2 (host boundary): Proxmox per-CT firewall ruleset enforced on the
+# hypervisor bridge — outside container root control.
+
+FW_MARKER="# vibe-sandbox managed firewall"
+
+validate_on_off() {   # $1 = var name, $2 = value
+  case "$2" in
+    on|off) return 0 ;;
+    *) die "invalid $1='$2' (expected 'on' or 'off')" ;;
+  esac
+}
+
+validate_cidr_or_ip() {   # $1 = token; strict IPv4/IPv6 or CIDR validation (blocks .fw rule injection)
+  local token="$1" addr prefix o1 o2 o3 o4
+  # Full-string regex (rejects newlines, whitespace, comments, and metacharacters)
+  [[ "$token" =~ ^[0-9A-Fa-f.:/]+$ ]] || return 1
+  if [[ "$token" == *.* ]]; then
+    # IPv4 or IPv4/prefix
+    if [[ "$token" == */* ]]; then
+      addr="${token%%/*}"
+      prefix="${token#*/}"
+      [[ "$prefix" =~ ^[0-9]{1,2}$ ]] && [ "$prefix" -ge 0 ] && [ "$prefix" -le 32 ] || return 1
+    else
+      addr="$token"
+    fi
+    [[ "$addr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    o1="${BASH_REMATCH[1]}"; o2="${BASH_REMATCH[2]}"
+    o3="${BASH_REMATCH[3]}"; o4="${BASH_REMATCH[4]}"
+    [ "$o1" -le 255 ] && [ "$o2" -le 255 ] && [ "$o3" -le 255 ] && [ "$o4" -le 255 ] || return 1
+    return 0
+  elif [[ "$token" == *:* ]]; then
+    # IPv6 or IPv6/prefix
+    if [[ "$token" == */* ]]; then
+      addr="${token%%/*}"
+      prefix="${token#*/}"
+      [[ "$prefix" =~ ^[0-9]{1,3}$ ]] && [ "$prefix" -ge 0 ] && [ "$prefix" -le 128 ] || return 1
+    else
+      addr="$token"
+    fi
+    # Require valid hex groups (1-4 hex digits), no :::, at most one ::, not bare ":"
+    [[ "$addr" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+    [ "$addr" != ":" ] || return 1
+    [[ "$addr" != *:::* ]] || return 1
+    local stripped="${addr/::/}"
+    [[ "$stripped" != *::* ]] || return 1
+    [[ "$addr" =~ [0-9A-Fa-f] ]] || [ "$addr" = "::" ] || return 1
+    [[ ! "$addr" =~ [0-9A-Fa-f]{5} ]] || return 1
+    return 0
+  fi
+  return 1
+}
+
+validate_hardening_config() {
+  validate_on_off VIBE_HARDEN "$VIBE_HARDEN"
+  validate_on_off VIBE_CONNECTORS "$VIBE_CONNECTORS"
+  validate_on_off VIBE_MCP "$VIBE_MCP"
+  validate_on_off VIBE_AUTO_APPROVE "$VIBE_AUTO_APPROVE"
+  validate_on_off FIREWALL "$FIREWALL"
+  case "$EGRESS_POLICY" in
+    lan-block|strict|off) ;;
+    *) die "invalid EGRESS_POLICY='$EGRESS_POLICY' (expected 'lan-block', 'strict', or 'off')" ;;
+  esac
+  if [ -n "$EGRESS_ALLOW" ]; then
+    local saved_ifs="$IFS" entry
+    IFS=','
+    for entry in $EGRESS_ALLOW; do
+      IFS="$saved_ifs"
+      entry="$(printf '%s' "$entry" | tr -d ' \t')"
+      [ -n "$entry" ] || continue
+      validate_cidr_or_ip "$entry" || die "invalid IP/CIDR '$entry' in EGRESS_ALLOW"
+    done
+    IFS="$saved_ifs"
+  fi
+}
+
+bool_toml() {
+  [ "$1" = "on" ] && echo "true" || echo "false"
+}
+
+firewall_active() {
+  [ "$FIREWALL" = "on" ] && [ "$EGRESS_POLICY" != "off" ]
+}
+
+datacenter_firewall_enabled() {
+  local cluster_fw="${FW_DIR}/cluster.fw"
+  [ -f "$cluster_fw" ] || return 1
+  awk '
+    /^\[/ { in_opt = ($0 ~ /^\[OPTIONS\][[:space:]]*$/); next }
+    in_opt && /^[[:space:]]*enable:[[:space:]]*1([[:space:]]*(#.*)?)?$/ { found = 1; exit }
+    END { exit(found ? 0 : 1) }
+  ' "$cluster_fw" 2>/dev/null
+}
+
+warn_datacenter_firewall() {
+  firewall_active || return 0
+  datacenter_firewall_enabled && return 0
+  echo "warning: Proxmox Datacenter firewall is disabled (${FW_DIR}/cluster.fw) — per-CT egress rules in ${FW_DIR}/${CTID}.fw are NOT enforced yet." >&2
+  echo "  to enable safely: ensure host SSH (22) & PVE UI (8006) access, then set Datacenter > Firewall > Options > Firewall: Yes." >&2
+}
+
+render_firewall_rules() {
+  local policy_out="ACCEPT"
+  [ "$EGRESS_POLICY" = "strict" ] && policy_out="DROP"
+  cat <<EOF
+${FW_MARKER} (CT ${CTID}, EGRESS_POLICY=${EGRESS_POLICY})
+[OPTIONS]
+enable: 1
+dhcp: 1
+policy_in: DROP
+policy_out: ${policy_out}
+
+[RULES]
+IN ACCEPT -p tcp -dport 22 -log nolog # sandbox SSH
+OUT ACCEPT -p udp -sport 68 -dport 67 -log nolog # DHCP client
+OUT ACCEPT -p udp -dport 53 -log nolog # DNS (UDP)
+OUT ACCEPT -p tcp -dport 53 -log nolog # DNS (TCP)
+EOF
+  if [ -n "$EGRESS_ALLOW" ]; then
+    local saved_ifs="$IFS" entry
+    IFS=','
+    for entry in $EGRESS_ALLOW; do
+      IFS="$saved_ifs"
+      entry="$(printf '%s' "$entry" | tr -d ' \t')"
+      [ -n "$entry" ] || continue
+      printf 'OUT ACCEPT -dest %s -log nolog # EGRESS_ALLOW\n' "$entry"
+    done
+    IFS="$saved_ifs"
+  fi
+  if [ "$EGRESS_POLICY" = "lan-block" ]; then
+    cat <<'EOF'
+OUT DROP -dest 10.0.0.0/8 -log nolog # block RFC1918 LAN
+OUT DROP -dest 172.16.0.0/12 -log nolog # block RFC1918 LAN
+OUT DROP -dest 192.168.0.0/16 -log nolog # block RFC1918 LAN
+OUT DROP -dest 169.254.0.0/16 -log nolog # block link-local / metadata
+OUT DROP -dest 100.64.0.0/10 -log nolog # block CGNAT
+OUT DROP -dest fc00::/7 -log nolog # block IPv6 ULA
+OUT DROP -dest fe80::/10 -log nolog # block IPv6 link-local
+EOF
+  fi
+}
+
+configure_firewall() {
+  validate_hardening_config
+  local fw_file="${FW_DIR}/${CTID}.fw" tmp_file
+  if ! firewall_active; then
+    if [ -f "$fw_file" ] && grep -qF "$FW_MARKER" "$fw_file" 2>/dev/null; then
+      rm -f "$fw_file"
+      echo "firewall: disabled (removed managed ruleset $fw_file)"
+    fi
+    return 0
+  fi
+  if [ -f "$fw_file" ] && ! grep -qF "$FW_MARKER" "$fw_file" 2>/dev/null; then
+    die "refusing to overwrite unmanaged firewall ruleset at $fw_file — remove it or set FIREWALL=off"
+  fi
+  mkdir -p "$FW_DIR"
+  # Atomic same-directory rename avoids partial writes on pmxcfs (/etc/pve)
+  tmp_file="${FW_DIR}/.${CTID}.fw.tmp.$$"
+  if ! render_firewall_rules > "$tmp_file"; then
+    rm -f "$tmp_file"
+    die "failed to write firewall ruleset temp file $tmp_file"
+  fi
+  mv -f "$tmp_file" "$fw_file"
+  echo "firewall: wrote host-enforced ruleset $fw_file (EGRESS_POLICY=$EGRESS_POLICY)"
+}
+
+remove_firewall() {
+  local fw_file="${FW_DIR}/${CTID}.fw"
+  if [ -f "$fw_file" ] && grep -qF "$FW_MARKER" "$fw_file" 2>/dev/null; then
+    rm -f "$fw_file"
+    echo "firewall: removed managed ruleset $fw_file"
+  fi
+}
+
+render_vibe_config() {
+  cat <<EOF
+# Managed by vibe-sandbox.sh (Issue #40 connector hardening)
+# Override at build time via VIBE_CONNECTORS / VIBE_MCP / VIBE_AUTO_APPROVE / VIBE_HARDEN
+enable_connectors = $(bool_toml "$VIBE_CONNECTORS")
+enable_mcp = $(bool_toml "$VIBE_MCP")
+enable_auto_approve = $(bool_toml "$VIBE_AUTO_APPROVE")
+EOF
+}
+
+inject_vibe_config() {
+  if [ "$VIBE_HARDEN" != "on" ]; then
+    echo "hardening: VIBE_HARDEN=off — skipping /root/.vibe/config.toml injection"
+    return 0
+  fi
+  local cfg_tmp
+  cfg_tmp="$(mktemp)"
+  render_vibe_config > "$cfg_tmp"
+  if ! pct exec "$CTID" -- mkdir -p /root/.vibe || ! pct push "$CTID" "$cfg_tmp" /root/.vibe/config.toml; then
+    rm -f "$cfg_tmp"
+    return 1
+  fi
+  rm -f "$cfg_tmp"
+  pct exec "$CTID" -- chown root:root /root/.vibe/config.toml
+  pct exec "$CTID" -- chmod 400 /root/.vibe/config.toml
+  echo "hardening: injected /root/.vibe/config.toml (connectors=$VIBE_CONNECTORS, mcp=$VIBE_MCP, auto_approve=$VIBE_AUTO_APPROVE)"
+}
+
+print_hardening_summary() {
+  local fw_state="off" vibe_state="off"
+  if firewall_active; then
+    if datacenter_firewall_enabled; then
+      fw_state="${EGRESS_POLICY} (active)"
+    else
+      fw_state="${EGRESS_POLICY} (pending Datacenter firewall)"
+    fi
+  fi
+  if [ "$VIBE_HARDEN" = "on" ]; then
+    vibe_state="connectors=${VIBE_CONNECTORS}, mcp=${VIBE_MCP}, auto_approve=${VIBE_AUTO_APPROVE}"
+  fi
+  echo "hardening: firewall=${fw_state}; vibe=(${vibe_state})"
+}
+
 # Create the sandbox CT. $1 = start | stopped. The hookscript is attached
 # whenever HOOK=on so the GUI trap works on every incarnation, stub included.
 # The ownership tag is set here; guard_ct() enforces it before any destroy.
 # The retained MAC is pinned via hwaddr so DHCP reservations survive rebuilds.
+# When firewall_active, the host-side PVE ruleset is written BEFORE pct create
+# and net0 carries firewall=1 so there is no unfiltered boot window.
 create_sandbox() {
-  local hookargs=() startargs=()
+  local hookargs=() startargs=() net0_opts
+  validate_hardening_config
   ensure_mac
+  configure_firewall
+  net0_opts="name=eth0,bridge=${BRIDGE},ip=dhcp${CT_MAC:+,hwaddr=$CT_MAC}"
+  firewall_active && net0_opts="${net0_opts},firewall=1"
   [ "$HOOK" = "on" ] && hookargs=(--hookscript "$HOOK_VOL_ID")
   [ "${1:-start}" = "start" ] && startargs=(--start 1)
   pct create "$CTID" "$TEMPLATE" \
     --hostname "$CTHOST" \
     --cores "$CORES" --memory "$RAM_MB" --swap "$SWAP_MB" \
     --rootfs "${STORAGE}:${DISK_GB}" \
-    --net0 "name=eth0,bridge=${BRIDGE},ip=dhcp${CT_MAC:+,hwaddr=$CT_MAC}" \
+    --net0 "$net0_opts" \
     --unprivileged 1 \
     --features nesting=1 \
     --ssh-public-keys "$SSH_PUBKEY" \
@@ -654,6 +906,9 @@ provision_and_report() {
   # permanent credential store -> fresh CT, every build
   inject_credentials
 
+  # hardened Vibe CLI config (default-deny connectors, MCP, auto-approve)
+  inject_vibe_config
+
   # user hook (deterministic per-use extras), if present
   if [ -f "$PROVISION_HOOK" ]; then
     pct push "$CTID" "$PROVISION_HOOK" /root/provision.sh
@@ -684,6 +939,7 @@ purge_known_hosts() {   # $1 = sandbox IP
 cmd_up() {
   self_check up
   lock_or_die
+  validate_hardening_config
   # AUTO REBUILD: never resume — tear down any prior sandbox first
   destroy_sandbox
 
@@ -702,6 +958,8 @@ cmd_up() {
   purge_known_hosts "$ip"
 
   provision_and_report
+  print_hardening_summary
+  warn_datacenter_firewall
 
   echo "sandbox ready."
   print_ssh_line "$ip"
@@ -710,6 +968,7 @@ cmd_up() {
 cmd_down() {
   lock_or_die
   [ "$EUID" -eq 0 ] || die "must run as root on the Proxmox host"
+  validate_hardening_config
   work_guard down || die "work guard: refusing to park CT $CTID"
   park_sandbox
   echo "sandbox parked: disk clobbered (CLOBBER=$CLOBBER), fresh stub at CT $CTID."
@@ -721,6 +980,7 @@ cmd_purge() {
   work_guard purge || die "work guard: refusing to purge CT $CTID"
   ct_running && pct stop "$CTID"
   destroy_sandbox
+  remove_firewall
   echo "CT $CTID removed entirely (no stub left in the tree)."
 }
 
@@ -878,6 +1138,7 @@ cmd_hook() {
     pre-start)
       self_check hook "$vmid" "$phase"
       hook_lock "$phase" || exit 0
+      validate_hardening_config
       echo "pre-start: rebuilding CT $CTID fresh"
       destroy_sandbox
       ensure_ssh_key
@@ -891,6 +1152,8 @@ cmd_hook() {
       ip="$(wait_for_ip)" || { echo "post-start: no IP (check ${BRIDGE}/DHCP)"; exit 0; }
       purge_known_hosts "$ip"
       provision_and_report
+      print_hardening_summary
+      warn_datacenter_firewall
       echo "sandbox ready via GUI."
       print_ssh_line "$ip"
       ;;
@@ -912,11 +1175,21 @@ cmd_hook() {
 }
 
 cmd_status() {
+  local fw_file="${FW_DIR}/${CTID}.fw" fw_info="none"
+  if [ -f "$fw_file" ]; then
+    local pol
+    pol="$(sed -n 's/.*EGRESS_POLICY=\([^)]*\)).*/\1/p' "$fw_file" | head -n 1)"
+    if datacenter_firewall_enabled; then
+      fw_info="${pol:-custom} (enforced)"
+    else
+      fw_info="${pol:-custom} (Datacenter firewall OFF)"
+    fi
+  fi
   if ! ct_exists; then echo "no sandbox (CT $CTID absent)"; exit 0; fi
   if ct_running; then
-    echo "CT $CTID running, ip: $(sandbox_ip)"
+    echo "CT $CTID running, ip: $(sandbox_ip), firewall: ${fw_info}"
   else
-    echo "CT $CTID exists but stopped (stub or unprovisioned)"
+    echo "CT $CTID exists but stopped (stub or unprovisioned), firewall: ${fw_info}"
   fi
 }
 

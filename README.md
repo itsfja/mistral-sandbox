@@ -66,6 +66,18 @@ outbound internet access — without handing it your machine.
   `main`, auto-install the current version (previous copy kept beside
   the script), and re-run once. `AUTO_UPDATE=off` disables; the `update`
   subcommand does it on demand.
+- **Connector-hardened** — every rebuild injects a hardened
+  `/root/.vibe/config.toml` (mode `400`) disabling Vibe connectors
+  (`VIBE_CONNECTORS=off`), MCP servers (`VIBE_MCP=off`), and
+  auto-approve/YOLO execution (`VIBE_AUTO_APPROVE=off`) by default.
+  `VIBE_HARDEN=off` skips config injection.
+- **Egress-firewalled** — with `FIREWALL=on` (default), `net0` carries
+  `firewall=1` and the host writes `/etc/pve/firewall/<CTID>.fw` outside
+  container root control. Default `EGRESS_POLICY=lan-block` permits
+  inbound SSH and outbound DHCP/DNS/internet while dropping outbound
+  RFC1918 LAN, link-local/metadata, CGNAT, and IPv6 ULA traffic;
+  `EGRESS_POLICY=strict` drops all other outbound traffic except
+  `EGRESS_ALLOW` destinations; `EGRESS_POLICY=off` disables it.
 
 ## Requirements
 
@@ -525,6 +537,110 @@ the sandbox hostname (`vibe-sandbox`) and the ownership tag
 The guard fails closed: in the GUI, a refused Start or Stop aborts the task
 with the refusal message in the task log rather than touching the CT.
 
+## Connector & egress hardening
+
+Isolating a Linux container only contains **compute and local filesystem
+state** — it does **not** contain information as long as outbound
+connectors are enabled or the container can probe internal network
+services. Even inside an unprivileged LXC container, an agent can
+introspect runtime, hostname, kernel, or hypervisor details and relay
+them outward through an enabled write-capable connector (for example, a
+Slack message, Gmail draft, Notion page, or GitHub issue).
+
+The isolation boundary therefore spans **three layers**:
+
+### 1. In-container Vibe configuration (automated on every rebuild)
+
+During provisioning (`up` and GUI Start), `vibe-sandbox.sh` injects
+`/root/.vibe/config.toml` (`chmod 400`, `root:root`) with default-deny
+settings:
+
+```toml
+enable_connectors = false
+enable_mcp = false
+enable_auto_approve = false
+```
+
+Override any individual setting on build when a task explicitly needs
+it, or disable injection with `VIBE_HARDEN=off`:
+
+```bash
+VIBE_MCP=on /root/vibe-sandbox.sh up
+VIBE_CONNECTORS=on VIBE_MCP=on /root/vibe-sandbox.sh up
+```
+
+Honest boundary caveat: the sandbox session runs as `root` inside the
+CT, so `/root/.vibe/config.toml` is a **default-deny guardrail** against
+implicit connector invocation and auto-approved execution — not a
+tamper-proof MAC boundary against a malicious root process inside the
+container. Layers 2 and 3 enforce the hard boundary outside the CT.
+
+### 2. Host-enforced Proxmox LXC firewall (outside container control)
+
+Because the Proxmox firewall runs on the hypervisor bridge (`veth`), a
+root process inside the sandbox cannot flush or disable it. With
+`FIREWALL=on` (default), `vibe-sandbox.sh` attaches `firewall=1` to
+`net0` and atomically writes `/etc/pve/firewall/<CTID>.fw` **before**
+the container boots:
+
+| `EGRESS_POLICY` | Inbound | Outbound |
+| --- | --- | --- |
+| `lan-block` *(default)* | `DROP` except SSH (`TCP 22`) | Allows DHCP (`UDP 67–68`), DNS (`UDP/TCP 53`), explicit `EGRESS_ALLOW`, and general internet; **DROPs** outbound RFC1918 LAN (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local/metadata (`169.254.0.0/16`), CGNAT (`100.64.0.0/10`), and IPv6 ULA/link-local (`fc00::/7`, `fe80::/10`) |
+| `strict` | `DROP` except SSH (`TCP 22`) | `policy_out: DROP`; allows **only** DHCP, DNS, and explicit comma-separated CIDRs/IPs in `EGRESS_ALLOW` |
+| `off` | Unmanaged | Unmanaged (`firewall=1` omitted; managed `.fw` removed) |
+
+Examples:
+
+```bash
+# Default: block LAN/host/metadata lateral movement, allow internet + LAN DNS
+/root/vibe-sandbox.sh up
+
+# Allow one internal LAN Git server while keeping the rest of the LAN blocked
+EGRESS_ALLOW=192.168.3.50/32 /root/vibe-sandbox.sh up
+
+# Strict egress: drop all outbound except an explicit proxy or IP allowlist
+EGRESS_POLICY=strict EGRESS_ALLOW=192.168.3.10/32 /root/vibe-sandbox.sh up
+```
+
+**Proxmox Datacenter firewall prerequisite:** Proxmox ignores per-CT
+`.fw` rules unless the Datacenter firewall is enabled in
+`/etc/pve/firewall/cluster.fw`. The script intentionally never enables
+the cluster firewall automatically (doing so without host rules could
+lock you out of SSH or the PVE web UI); instead, `up` and `status` warn
+you when it is off. To enable it safely:
+
+1. In the Proxmox GUI, verify host management access is permitted (Proxmox
+   allows management subnet access to port `8006` and `22` by default, or
+   add explicit Datacenter `IN ACCEPT` rules for your admin LAN on ports
+   `22` and `8006` first).
+2. Enable **Datacenter > Firewall > Options > Firewall: Yes**.
+3. Run `/root/vibe-sandbox.sh status` and confirm it reports
+   `firewall: lan-block (enforced)`.
+
+### 3. Mistral Vibe Work & account-level connectors (manual checklist)
+
+Connectors attached to your Mistral account (Slack, Gmail, Notion,
+GitHub App, Linear, Atlassian, Outlook, Box, SharePoint, Stripe) live
+outside the container and host, so this script cannot toggle them. When
+running sandboxed sessions alongside Vibe Work:
+
+1. **Default-deny connectors per chat.** Disable all connectors inside
+   the sandbox chat (**`+` > Tools**, toggle connectors off) while
+   keeping them connected at the account level for normal work.
+2. **Never pre-authorize connector functions ("Always allow").** Require
+   explicit per-action approval for every outbound call so writes cannot
+   fire silently.
+3. **Restrict write-capable connectors.** Prefer read-only connector
+   functions, or keep write-capable connectors disabled entirely for
+   sandboxed runs.
+4. **Strip ambient context channels.** Do not attach scheduled tasks,
+   shared projects, libraries, or knowledge files that carry host, LAN,
+   or hypervisor details into a sandbox session.
+
+References:
+- [Mistral Vibe Work Connectors](https://docs.mistral.ai/vibe/work/connectors)
+- [Mistral Vibe Work Safety and Approvals](https://docs.mistral.ai/vibe/work/safety-and-approvals)
+
 ## Troubleshooting
 
 - `no debian-12 template found; set TEMPLATE manually` — the host's
@@ -652,6 +768,28 @@ with the refusal message in the task log rather than touching the CT.
   refusals appear in the PVE task log (the hookscript cannot prompt);
   an unattended cron rebuild fails closed the same way, naming the
   repos in its log.
+- `warning: Proxmox Datacenter firewall is disabled ... per-CT egress rules ... are NOT enforced yet` —
+  the script wrote `/etc/pve/firewall/<CTID>.fw` and attached
+  `firewall=1` on `net0`, but Proxmox does not enforce per-CT rules
+  until **Datacenter > Firewall > Options > Firewall** is set to `Yes`.
+  Ensure management access to ports `22` and `8006` is allowed before
+  turning it on, or pass `FIREWALL=off` if you intentionally manage
+  egress elsewhere.
+- Container cannot reach an internal Git server, proxy, or registry on
+  your LAN — expected under the default `EGRESS_POLICY=lan-block`
+  (RFC1918 egress is dropped except DNS on port 53). Punch a surgical
+  hole with `EGRESS_ALLOW=<ip>/32`, or use `EGRESS_POLICY=off` if you
+  explicitly want unrestricted LAN reachability.
+- `refusing to overwrite unmanaged firewall ruleset at /etc/pve/firewall/<CTID>.fw` —
+  a pre-existing `.fw` file without this script's management marker sits
+  at that CTID. Inspect and remove it if it is stale, pick another
+  `CTID`, or pass `FIREWALL=off`.
+- Vibe CLI blocks MCP servers, connectors, or `--yolo` / auto-approve —
+  expected by default: `/root/.vibe/config.toml` sets
+  `enable_connectors = false`, `enable_mcp = false`, and
+  `enable_auto_approve = false`. Re-enable selectively at build time
+  with `VIBE_MCP=on`, `VIBE_CONNECTORS=on`, or `VIBE_AUTO_APPROVE=on`
+  (or `VIBE_HARDEN=off`).
 
 ## Subcommands
 
@@ -733,8 +871,19 @@ rescue archive is still taken first when work is found),
 `RESCUE_STORAGE` (comma-separated preference list of rescue backup
 storages, checked in order; `auto` = the first storage with backup
 content; default `unraid-lvm,auto`), `RESCUE_KEEP` (rescue
-archives of this CT to retain; default `2`), and
-`RAW_URL` (where the self-check fetches the current script from).
+archives of this CT to retain; default `2`), `RAW_URL` (where the
+self-check fetches the current script from), `VIBE_HARDEN` (`on`/`off`:
+inject hardened `/root/.vibe/config.toml`; default `on`),
+`VIBE_CONNECTORS` (`off`/`on`: `enable_connectors` in injected Vibe
+config; default `off`), `VIBE_MCP` (`off`/`on`: `enable_mcp` in
+injected Vibe config; default `off`), `VIBE_AUTO_APPROVE` (`off`/`on`:
+`enable_auto_approve` in injected Vibe config; default `off`),
+`FIREWALL` (`on`/`off`: attach `firewall=1` to `net0` and manage
+`/etc/pve/firewall/<CTID>.fw`; default `on`), `EGRESS_POLICY`
+(`lan-block`/`strict`/`off`: host-enforced outbound firewall policy;
+default `lan-block`), `EGRESS_ALLOW` (optional comma-separated IPv4/IPv6
+IPs or CIDRs allowed outbound), and `FW_DIR` (Proxmox firewall config
+directory; default `/etc/pve/firewall`).
 
 ## Hooks
 
@@ -772,3 +921,11 @@ hookscript — this one is your per-use provisioning hook.)
 - Destructive operations are ownership-guarded: the script refuses to
   destroy or wipe any CT that does not carry its tag and hostname, and
   the guard fails closed in GUI hooks.
+- The isolation boundary includes **tool and connector access**, not
+  just the container or hypervisor: outbound connectors are write
+  channels that can exfiltrate container/host introspection even when
+  local network egress is restricted. Every build disables Vibe CLI
+  connectors, MCP servers, and auto-approve by default and attaches a
+  host-enforced Proxmox firewall (`EGRESS_POLICY=lan-block`); disable
+  account-level Vibe Work connectors per-chat as well (see
+  [Connector & egress hardening](#connector--egress-hardening)).
