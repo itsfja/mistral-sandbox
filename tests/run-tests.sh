@@ -23,7 +23,7 @@ fresh() {   # new isolated world; sets T and S (script copy outside any git chec
 # Host-side paths, redirected into the test world. A PVE hookscript gets
 # none of the caller's environment, so gui_hook passes them explicitly
 # (on a real host they are the script defaults).
-HOSTVARS='SSH_KEY_FILE=$T/host/ssh MAC_FILE=$T/host/mac SECRETS_FILE=$T/host/secrets.env STUB_MARKER=$T/host/pristine-stub FW_DIR=$T/fw HOOK_SNIPPET_DIR=$T/snip AUTO_UPDATE=off TEMPLATE=local:vztmpl/debian-12.tar.zst'
+HOSTVARS='CONFIG_FILE=$T/host/conf SSH_KEY_FILE=$T/host/ssh MAC_FILE=$T/host/mac SECRETS_FILE=$T/host/secrets.env STUB_MARKER=$T/host/pristine-stub FW_DIR=$T/fw HOOK_SNIPPET_DIR=$T/snip AUTO_UPDATE=off TEMPLATE=local:vztmpl/debian-12.tar.zst'
 run() {   # run the script copy in the mock world, with the caller's env
   eval "env PATH=\"$HERE/bin:\$PATH\" HOME=\"\$T/home\" $HOSTVARS EXPORT_DIR=\"\$T/export\" \"\$@\""
 }
@@ -140,6 +140,40 @@ out="$(run EGRESS_DENY='2a10::/48;DROP' FORCE=1 RESCUE=0 "$S" up 2>&1)"; rc=$?
 check "invalid EGRESS_DENY rejected (no .fw injection)" [ $rc -ne 0 ] && grep -q "invalid IP/CIDR '2a10::/48;DROP' in EGRESS_DENY" <<<"$out"
 out="$(run MOCK_IPV6="$V6" EGRESS_POLICY=strict FORCE=1 RESCUE=0 "$S" up 2>&1)"
 check "strict policy -> no IPv6 warning" bash -c "! grep -q 'public IPv6' <<<\"\$1\"" _ "$out"
+
+echo "== host config file (settings that survive GUI hooks)"
+fresh
+printf '# site settings\nEGRESS_DENY=2a10:d585:7f66::/48\nCORES="2"\nBOGUS=$(touch %s/pwned)\n' "$T" > "$T/host/conf"; chmod 600 "$T/host/conf"
+out="$(run "$S" up 2>&1)"; rc=$?
+check "up with a config file exits 0" [ $rc -eq 0 ]
+[ $rc -eq 0 ] || echo "$out" | tail -5
+check "  ...EGRESS_DENY from the file lands in the .fw" grep -q '^OUT DROP -dest 2a10:d585:7f66::/48 .*EGRESS_DENY' "$T/fw/1042.fw"
+check "  ...quoted value read (cores 2)" grep -q -- '--cores 2 ' "$T/calls.log"
+check "  ...values are never executed" [ ! -e "$T/pwned" ]
+run CORES=6 FORCE=1 RESCUE=0 "$S" up >/dev/null 2>&1
+check "command-line env beats the file (cores 6)" grep -q -- '--cores 6 ' "$T/calls.log"
+rm -f "$T/run/1042"
+out="$(gui_hook 1042 post-stop FORCE=1)"; rc=$?
+check "GUI Stop (empty env) parks a stub" [ $rc -eq 0 ] && [ -e "$T/host/pristine-stub" ]
+check "  ...and the rewritten .fw keeps EGRESS_DENY" grep -q 'EGRESS_DENY' "$T/fw/1042.fw"
+mkdir -p "$T/locked"; touch "$T/locked/1042"
+out="$(gui_hook 1042 pre-start)"; rc=$?
+check "GUI Start (empty env) keeps EGRESS_DENY too" [ $rc -eq 0 ] && grep -q 'EGRESS_DENY' "$T/fw/1042.fw"
+rm -f "$T/locked/1042"
+touch "$T/run/1042"
+out="$(run MOCK_IPV6=2a10:d585:7f66:2::5 "$S" hook 1042 post-start 2>&1)"
+check "  ...so no public-IPv6 warning" bash -c "! grep -q 'public IPv6' <<<\"\$1\"" _ "$out"
+chmod 666 "$T/host/conf"
+out="$(run "$S" status 2>&1)"; check "group/world-writable config refused" grep -q 'refusing .*conf: group/other-writable' <<<"$out"
+chmod 600 "$T/host/conf"; printf 'CONFIG_FILE=/tmp/x\n' >> "$T/host/conf"
+out="$(run "$S" status 2>&1)"; check "CONFIG_FILE cannot be set from the file" grep -q 'CONFIG_FILE cannot be set' <<<"$out"
+printf 'not a valid line\n' > "$T/host/conf"
+out="$(run "$S" status 2>&1)"; check "malformed line refused" grep -q 'bad line in' <<<"$out"
+printf 'X=1\n' > "$T/host/conf"; chown 65534 "$T/host/conf"
+out="$(run "$S" status 2>&1)"; check "non-root-owned config refused" grep -q 'not owned by root' <<<"$out"
+fresh
+out="$(run MOCK_IPV6=2a10:d585:7f66:2::5 "$S" up 2>&1)"
+check "IPv6 warning points at the config file" grep -q "add your site's delegated prefix to $T/host/conf" <<<"$out"
 
 echo "== ssh, self-update in a git checkout (#45)"
 fresh

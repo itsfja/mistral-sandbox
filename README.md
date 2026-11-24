@@ -618,16 +618,26 @@ EGRESS_ALLOW=192.168.3.50/32 /root/vibe-sandbox.sh up
 # Strict egress: drop all outbound except an explicit proxy or IP allowlist
 EGRESS_POLICY=strict EGRESS_ALLOW=192.168.3.10/32 /root/vibe-sandbox.sh up
 
-# Native IPv6: also block your site's public range (your ISP-delegated prefix)
-EGRESS_DENY=2001:db8:1234::/48 /root/vibe-sandbox.sh up
 ```
+
+Settings you want on **every** build, GUI Start/Stop included, belong in
+the [host config file](#configuration), not on the command line (see
+below).
 
 **Native IPv6.** `lan-block`'s built-in ranges are all private. On a
 network with native IPv6 the sandbox gets a public SLAAC address and a
 default route, and every LAN device's own public IPv6 address stays
 reachable unless you list your site's prefix in `EGRESS_DENY`
 (comma-separated CIDRs, dropped after `EGRESS_ALLOW`, so a single
-allowed host inside the range still gets through). `up` and GUI Start
+allowed host inside the range still gets through). Put it in the host
+config file, so GUI Stop and Start keep it too:
+
+```bash
+printf 'EGRESS_DENY=2001:db8:1234::/48\n' >> /root/.vibe-sandbox.conf
+chmod 600 /root/.vibe-sandbox.conf
+/root/vibe-sandbox.sh up
+```
+ `up` and GUI Start
 warn when the sandbox has a public IPv6 address and `EGRESS_DENY` is
 empty, and suggest the /48 to use.
 
@@ -902,7 +912,34 @@ Mistral usage.
 
 ## Configuration
 
-All overridable by environment variables: `CTID`, `CTHOST`, `CORES`,
+### Host config file
+
+Settings that should apply to **every** run go in `/root/.vibe-sandbox.conf`
+(override the path with `CONFIG_FILE`): one `KEY=value` per line, `#`
+comments allowed, values optionally quoted. The script reads the file and
+never executes it. It must be owned by root and not group/other-writable,
+or the script refuses to run.
+
+```bash
+cat > /root/.vibe-sandbox.conf <<'CONF'
+# vibe-sandbox site settings
+EGRESS_DENY=2a10:d585:7f66::/48
+CONF
+chmod 600 /root/.vibe-sandbox.conf
+```
+
+Why a file: Proxmox runs the GUI hookscript with an almost empty
+environment, so a variable you export or put on the command line only
+applies to that one CLI run. A later GUI Stop rebuilds the stub and its
+firewall ruleset with the built-in defaults instead. The file is read by
+CLI runs and GUI hooks alike.
+
+Precedence: command line / environment > config file > built-in default.
+`CONFIG_FILE`, `PATH` and `HOME` cannot be set from the file.
+
+### Variables
+
+All settable in the config file or as environment variables: `CTID`, `CTHOST`, `CORES`,
 `RAM_MB`, `SWAP_MB`, `DISK_GB`, `STORAGE`, `BRIDGE`, `TEMPLATE`,
 `SSH_PUBKEY` (use an existing key instead of the managed one),
 `SSH_KEY_FILE` (where the managed keypair lives), `MAC_FILE` (where the
