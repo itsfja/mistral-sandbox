@@ -977,7 +977,10 @@ directory; default `/etc/pve/firewall`).
 
 ## Hooks
 
-Place a `provision.sh` beside the script to run extra setup inside each
+Place a `provision.sh` beside the script (the real file: if you run it
+through a symlink such as `/root/vibe-sandbox.sh` -> a git clone, put
+`provision.sh` in the clone; set `PROVISION_HOOK` to use another path) to
+run extra setup inside each
 fresh container after base provisioning (toolchains, repo clones). Keep it
 deterministic to keep rebuilds identical. (Unrelated to the PVE
 hookscript — this one is your per-use provisioning hook.) It runs as

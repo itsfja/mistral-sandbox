@@ -209,7 +209,10 @@ CLOBBER="${CLOBBER:-discard}"         # discard | zero | off - post-stop rootfs 
 SANDBOX_TAG="${SANDBOX_TAG:-vibe-sandbox}"   # ownership tag; guard_ct() enforces it
 HOOK_VOL_ID="local:snippets/vibe-sandbox-hook.sh"
 HOOK_SNIPPET_DIR="${HOOK_SNIPPET_DIR:-/var/lib/vz/snippets}"
-PROVISION_HOOK="$(dirname "$0")/provision.sh"
+# beside the REAL script (symlinks resolved), so CLI runs through a symlink
+# such as /root/vibe-sandbox.sh and the GUI hook shim (which execs the
+# resolved path) find the same file
+PROVISION_HOOK="${PROVISION_HOOK:-$(dirname "$(readlink -f "$0")")/provision.sh}"
 EXPORT_DIR="${EXPORT_DIR:-/root/vibe-sandbox-export}"     # desktop bundle output dir
 AUTO_UPDATE="${AUTO_UPDATE:-on}"        # on = build paths self-check against main; off = never check
 RAW_URL="${RAW_URL:-https://raw.githubusercontent.com/itsfja/mistral-sandbox/main/vibe-sandbox.sh}"
