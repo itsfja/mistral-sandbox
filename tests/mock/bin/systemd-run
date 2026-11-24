@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Mock systemd-run: record the scheduled command (shell-quoted) in
+# $MOCK_T/deferred.cmd instead of running it; tests run it later, once the
+# simulated PVE Stop task has released the CT.
+T="${MOCK_T:?}"
+echo "systemd-run $*" >> "$T/calls.log"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --unit|--description|-p|--property) shift 2 ;;
+    --*) shift ;;
+    *) break ;;
+  esac
+done
+printf '%q ' "$@" > "$T/deferred.cmd"

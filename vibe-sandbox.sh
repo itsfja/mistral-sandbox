@@ -41,14 +41,18 @@
 #   * GUI-TRAPPED:      with HOOK=on (default), the Proxmox GUI drives the
 #                      whole lifecycle through a pct hookscript:
 #                        right-click Stop    = disk clobber + parked stub
+#                                              (about a minute after the
+#                                              Stop task ends)
 #                        right-click Start   = boot the parked, never-
 #                                              booted stub + provisioning
-#                        right-click Restart = both of the above
-#                      The rebuild happens at Stop, not Start: Proxmox
-#                      holds the CT's lock for the whole Start task, so
-#                      a pre-start hook cannot destroy/create the CT.
-#                      Start refuses (run `up`) unless the CT is a
-#                      pristine stub ($STUB_MARKER).
+#                      Proxmox holds the CT's lock for the whole Start and
+#                      Stop tasks, hooks included, so no hook can destroy
+#                      or create the CT: post-stop hands the rebuild to a
+#                      transient systemd unit that runs once the Stop task
+#                      has released the CT, and pre-start only boots a
+#                      pristine stub ($STUB_MARKER), else refuses (run
+#                      `up`). Restart therefore refuses its Start half:
+#                      use Stop, then Start once the park has finished.
 #                      The hook shim is auto-deployed to local:snippets on
 #                      every run; set HOOK=off to disable GUI trapping.
 #   * CLOBBERED:        on stop, the rootfs is discarded (CLOBBER=discard,
@@ -134,6 +138,7 @@
 #   update    self-update the script from main (previous copy kept as .bak;
 #             refuses inside a git checkout: use git pull there)
 #   hook      INTERNAL — called by the PVE hookscript shim with (vmid, phase)
+#   park-deferred INTERNAL — run by systemd after a GUI Stop (see schedule_park)
 #
 # Optional: place a `provision.sh` beside this script — it runs INSIDE the
 # fresh CT on every build, AFTER the base provisioning (extra toolchains, repo
@@ -202,6 +207,7 @@ SSH_PUBKEY="${SSH_PUBKEY:-}"           # optional override; empty = managed keyp
 SSH_KEY_FILE="${SSH_KEY_FILE:-/root/.vibe-sandbox-ssh}"   # host-side keypair (permanent)
 MAC_FILE="${MAC_FILE:-/root/.vibe-sandbox.mac}"  # host-side MAC store (permanent)
 STUB_MARKER="${STUB_MARKER:-/root/.vibe-sandbox.pristine-stub}"  # "the stopped CT has never booted"
+PARK_UNIT="vibe-sandbox-park-${CTID}"  # transient systemd unit that parks after a GUI Stop
 CT_MAC="${CT_MAC:-}"                   # optional override; empty = managed MAC
 SECRETS_FILE="${SECRETS_FILE:-/root/.vibe-sandbox.env}"   # host-side key store
 HOOK="${HOOK:-on}"                    # on = attach PVE hookscript (GUI trap)
@@ -955,6 +961,45 @@ park_sandbox() {
   mark_stub_pristine
 }
 
+# GUI Stop cannot park in its own post-stop hook either: Proxmox keeps the
+# CT's config lock for the whole Stop task, and the task does not end until
+# the post-stop hook has returned (and `pct status` still says "running"
+# meanwhile). Any pct stop/destroy/create from the hook times out on that
+# lock. So post-stop only hands the park to a transient systemd unit
+# ($PARK_UNIT) and returns; the unit waits until PVE has finished the Stop
+# (pve-container@<CTID> inactive, lock released), takes the serial lock,
+# re-checks, then parks. systemd-run, not `cmd &`: a background child of
+# the hook would sit in the container's cgroup and be killed with it.
+park_job_active() { systemctl is-active --quiet "$PARK_UNIT" 2>/dev/null; }
+
+schedule_park() {
+  if park_job_active; then
+    echo "post-stop: a park job ($PARK_UNIT) is already running"
+    return 0
+  fi
+  systemd-run --unit "$PARK_UNIT" --collect --no-block --quiet \
+    --description "vibe-sandbox: park CT $CTID after GUI Stop" \
+    "$(readlink -f "$0")" park-deferred \
+    || die "post-stop: could not schedule the park job (systemd-run). On the host, run: $0 down"
+}
+
+# INTERNAL: body of $PARK_UNIT (run by systemd, outside any PVE task).
+cmd_park_deferred() {
+  exec 9>"$LOCK_FILE"
+  flock -w 600 9 || die "park: timed out waiting for the serial lock"
+  local waited=0
+  while systemctl is-active --quiet "pve-container@${CTID}" 2>/dev/null; do
+    [ "$waited" -lt 180 ] || die "park: CT $CTID still not fully stopped after 3 minutes. On the host, run: $0 down"
+    sleep 2; waited=$((waited + 2))
+  done
+  ct_exists || { echo "park: CT $CTID is gone - nothing to park"; return 0; }
+  ct_running && { echo "park: CT $CTID was started again meanwhile - not parking it"; return 0; }
+  stub_is_pristine && { echo "park: CT $CTID is already a fresh stub"; return 0; }
+  validate_hardening_config
+  park_sandbox
+  echo "park: CT $CTID clobbered and parked as a fresh stub - ready for GUI Start"
+}
+
 # Pristine-stub marker. GUI Start cannot rebuild the CT: Proxmox holds the
 # CT's config lock (/run/lock/lxc/pve-config-<CTID>.lock) for the whole
 # Start task, pre-start hook included, so any pct destroy/create from the
@@ -1286,7 +1331,8 @@ EOF
 #                mark_stub_pristine); otherwise abort the Start
 #   post-start — wait for IP, provision, log the ssh line
 #   pre-stop   — work guard: refuse stops that would lose unextracted work
-#   post-stop  — clobber + park stub
+#   post-stop  — schedule the park ($PARK_UNIT: clobber + fresh stub), which
+#                runs once PVE has released the CT (see schedule_park)
 # All destructive phases go through guard_ct(): if the CT at $CTID is not
 # provably ours, the hook ABORTS the GUI task instead of touching it.
 # Hook phases lock with hook_lock(), never lock_or_die: a phase can fire
@@ -1307,6 +1353,9 @@ cmd_hook() {
       # on that lock). Boot only a pristine stub left by down / GUI Stop;
       # anything else aborts the Start (non-zero exit) with directions.
       self_check hook "$vmid" "$phase"
+      # checked before hook_lock: the park job holds the serial lock, and
+      # a lock holder would otherwise make this phase pass through
+      ! park_job_active || die "pre-start: CT $CTID is still being parked after the last Stop (unit $PARK_UNIT). Wait a minute, then Start again; progress: journalctl -u $PARK_UNIT"
       hook_lock "$phase" || exit 0
       validate_hardening_config
       guard_ct
@@ -1338,8 +1387,9 @@ cmd_hook() {
       ;;
     post-stop)
       hook_lock "$phase" || exit 0
-      park_sandbox
-      echo "post-stop: sandbox clobbered and parked as a fresh stub (CT $CTID)"
+      schedule_park
+      echo "post-stop: parking CT $CTID once Proxmox releases it (unit $PARK_UNIT, about a minute);"
+      echo "  GUI Start works when it is done. Progress: journalctl -u $PARK_UNIT"
       ;;
     *)
       exit 0 ;;
@@ -1360,6 +1410,8 @@ cmd_status() {
   if ! ct_exists; then echo "no sandbox (CT $CTID absent)"; exit 0; fi
   if ct_running; then
     echo "CT $CTID running, ip: $(sandbox_ip), firewall: ${fw_info}"
+  elif park_job_active; then
+    echo "CT $CTID stopped: being parked after GUI Stop (unit $PARK_UNIT); GUI Start works when done, firewall: ${fw_info}"
   elif stub_is_pristine; then
     echo "CT $CTID stopped: fresh stub, ready for GUI Start, firewall: ${fw_info}"
   else
@@ -1419,6 +1471,7 @@ case "${1:-}" in
   export) shift; cmd_export ;;
   update)  shift; cmd_update ;;
   hook)   shift; cmd_hook "$@" ;;
+  park-deferred) shift; cmd_park_deferred ;;
   *) awk '/^set -/ {exit} /^#/ {print}' "$0"; exit 1 ;;
 esac
 
