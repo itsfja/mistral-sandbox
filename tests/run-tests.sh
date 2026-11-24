@@ -45,6 +45,8 @@ check "provisioning in a clean env with HOME=/root" grep -qE '^pct exec 1042 -- 
 check "provision script pushed, mode 700" [ "$(stat -c %a "$T/ct/1042/root/provision-base.sh")" = 700 ]
 check "  ...disables dpkg progress lines" grep -q 'Dpkg::Use-Pty=0' "$T/ct/1042/root/provision-base.sh"
 check "  ...is valid bash" bash -n "$T/ct/1042/root/provision-base.sh"
+check "  ...pins key-only sshd: no root password login" grep -q 'PermitRootLogin prohibit-password' "$T/ct/1042/root/provision-base.sh"
+check "  ...and no password or keyboard-interactive auth at all" bash -c "grep -q 'PasswordAuthentication no' '$T/ct/1042/root/provision-base.sh' && grep -q 'KbdInteractiveAuthentication no' '$T/ct/1042/root/provision-base.sh'"
 C="$T/ct/1042/root/.vibe/config.toml"
 check "vibe config injected, mode 400, all default-deny" [ "$(stat -c %a "$C")" = 400 ] && [ "$(grep -c '= false$' "$C")" = 3 ]
 check "missing key store -> wizard warning" grep -q 'no key store at' <<<"$out"
