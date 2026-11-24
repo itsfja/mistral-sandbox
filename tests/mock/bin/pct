@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Mock of Proxmox `pct` for dry-running vibe-sandbox.sh. State in $MOCK_T.
+set -euo pipefail
+T="${MOCK_T:?}"
+mkdir -p "$T/conf" "$T/ct" "$T/run"
+echo "pct $*" >> "$T/calls.log"
+cmd="$1"; shift
+# Proxmox holds /run/lock/lxc/pve-config-<id>.lock for a whole Start task,
+# hookscript pre-start included. Tests simulate that by touching
+# $T/locked/<id>: commands that need the lock then time out like PVE does.
+case "$cmd" in
+  create|destroy|set|start|stop|push)
+    if [ -e "$T/locked/${1:-}" ]; then
+      echo "trying to acquire lock..." >&2
+      echo "can't lock file '/run/lock/lxc/pve-config-$1.lock' - got timeout" >&2
+      exit 255
+    fi ;;
+esac
+case "$cmd" in
+  list)
+    echo "VMID       Status     Lock         Name"
+    for f in "$T"/conf/*.conf; do
+      [ -e "$f" ] || continue
+      id="$(basename "$f" .conf)"
+      st=stopped; [ -e "$T/run/$id" ] && st=running
+      printf '%-10s %-10s %-12s %s\n' "$id" "$st" "" "$(awk '/^hostname:/ {print $2}' "$f")"
+    done ;;
+  status)
+    id="$1"; [ -e "$T/conf/$id.conf" ] || { echo "Configuration file 'nodes/pve/lxc/$id.conf' does not exist" >&2; exit 2; }
+    if [ -e "$T/run/$id" ]; then echo "status: running"; else echo "status: stopped"; fi ;;
+  config)
+    id="$1"; [ -e "$T/conf/$id.conf" ] || exit 2; cat "$T/conf/$id.conf" ;;
+  create)
+    id="$1"; tmpl="$2"; shift 2
+    [ -e "$T/conf/$id.conf" ] && { echo "CT $id already exists" >&2; exit 2; }
+    start=0; : > "$T/conf/$id.conf"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --hostname) echo "hostname: $2" >> "$T/conf/$id.conf" ;;
+        --tags) echo "tags: $2" >> "$T/conf/$id.conf" ;;
+        --net0) echo "net0: $2" >> "$T/conf/$id.conf" ;;
+        --rootfs) echo "rootfs: $2,size=40G" >> "$T/conf/$id.conf" ;;
+        --hookscript) echo "hookscript: $2" >> "$T/conf/$id.conf" ;;
+        --start) start="$2" ;;
+      esac
+      shift 2
+    done
+    echo "ostemplate: $tmpl" >> "$T/conf/$id.conf"
+    rm -rf "$T/ct/$id"; mkdir -p "$T/ct/$id"
+    [ "$start" = 1 ] && touch "$T/run/$id"
+    true ;;
+  start) touch "$T/run/$1" ;;
+  stop)  rm -f "$T/run/$1" ;;
+  destroy) rm -f "$T/conf/$1.conf" "$T/run/$1"; rm -rf "$T/ct/$1" ;;
+  set) echo "set $*" >> "$T/calls.log" ;;
+  enter) echo "(would enter CT $1)" ;;
+  push)
+    id="$1"; src="$2"; dest="$3"
+    mkdir -p "$(dirname "$T/ct/$id$dest")"; cp "$src" "$T/ct/$id$dest" ;;
+  exec)
+    id="$1"; shift; [ "$1" = "--" ] && shift
+    [ -e "$T/run/$id" ] || { echo "CT $id not running" >&2; exit 1; }
+    # ct_run: env -i KEY=VAL... cmd  -> drop the env wrapper
+    if [ "$1" = env ]; then
+      shift; [ "$1" = -i ] && shift
+      while [[ "${1:-}" == *=* ]]; do shift; done
+    fi
+    case "$1" in
+      mkdir) shift; for a in "$@"; do [ "$a" = -p ] || mkdir -p "$T/ct/$id$a"; done ;;
+      chown) : ;;
+      ip)    # `ip -6 -o addr show scope global`: addresses from MOCK_IPV6
+        for a in ${MOCK_IPV6:-}; do
+          echo "2: eth0    inet6 $a/64 scope global dynamic mngtmpaddr \       valid_lft 85956sec"
+        done ;;
+      chmod) chmod "$2" "$T/ct/$id$3" ;;
+      sh)
+        case "$3" in
+          *'cat > "$1"'*)   # ct_push_file: sh -c SCRIPT sh DEST MODE < src
+            dest="$T/ct/$id$5"; mkdir -p "$(dirname "$dest")"
+            cat > "$dest"; chmod "$6" "$dest" ;;
+          *) echo "${MOCK_IP:-192.168.3.77}" ;;
+        esac ;;
+      bash) [ "$2" = "-c" ] && exit 0; echo "(mock: would run $2 in CT $id)" ;;
+      *) echo "(mock exec: $*)" ;;
+    esac ;;
+  *) echo "mock pct: unhandled $cmd" >&2; exit 3 ;;
+esac

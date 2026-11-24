@@ -40,9 +40,15 @@
 #                      Override with CT_MAC to pin a specific MAC.
 #   * GUI-TRAPPED:      with HOOK=on (default), the Proxmox GUI drives the
 #                      whole lifecycle through a pct hookscript:
-#                        right-click Start   = fresh rebuild + provisioning
 #                        right-click Stop    = disk clobber + parked stub
-#                        right-click Restart = fresh rebuild
+#                        right-click Start   = boot the parked, never-
+#                                              booted stub + provisioning
+#                        right-click Restart = both of the above
+#                      The rebuild happens at Stop, not Start: Proxmox
+#                      holds the CT's lock for the whole Start task, so
+#                      a pre-start hook cannot destroy/create the CT.
+#                      Start refuses (run `up`) unless the CT is a
+#                      pristine stub ($STUB_MARKER).
 #                      The hook shim is auto-deployed to local:snippets on
 #                      every run; set HOOK=off to disable GUI trapping.
 #   * CLOBBERED:        on stop, the rootfs is discarded (CLOBBER=discard,
@@ -83,7 +89,9 @@
 #                      (backup at $0.bak, atomic mv) and re-exec ONCE, so
 #                      the build runs current code. The check degrades to
 #                      a warning when it cannot run. AUTO_UPDATE=off
-#                      disables; `update` does it explicitly.
+#                      disables; `update` does it explicitly. A copy
+#                      inside a git checkout is never self-updated (that
+#                      would conflict with `git pull`).
 #
 #   * CONNECTOR-HARDENED: every rebuild injects a hardened /root/.vibe/config.toml
 #                      (mode 400) disabling Vibe connectors (VIBE_CONNECTORS=off),
@@ -97,7 +105,9 @@
 #                      /etc/pve/firewall/<CTID>.fw (outside container root
 #                      control). Default EGRESS_POLICY=lan-block allows inbound
 #                      SSH + outbound DHCP/DNS/internet while dropping outbound
-#                      RFC1918 LAN, link-local/metadata, CGNAT, and IPv6 ULA;
+#                      RFC1918 LAN, link-local/metadata, CGNAT, and IPv6 ULA,
+#                      plus EGRESS_DENY (set it to your site's public IPv6
+#                      prefix: with native IPv6 the LAN is not only private);
 #                      EGRESS_POLICY=strict sets policy_out=DROP with explicit
 #                      EGRESS_ALLOW CIDRs/IPs; EGRESS_POLICY=off disables.
 #                      Enforced when Proxmox Datacenter firewall is enabled.
@@ -112,9 +122,11 @@
 #   reset     down then up (fresh rebuild mid-work)
 #   status    is the sandbox up? show CTID, state, IP
 #   shell     drop into a root shell inside the CT
+#   ssh       ssh into the CT with the managed key: ssh [command...]
 #   ip        print the current IP (empty if not running)
 #   export    bundle the keypair + ssh-config for desktop use (after 'up')
-#   update    self-update the script from main (previous copy kept as .bak)
+#   update    self-update the script from main (previous copy kept as .bak;
+#             refuses inside a git checkout: use git pull there)
 #   hook      INTERNAL — called by the PVE hookscript shim with (vmid, phase)
 #
 # Optional: place a `provision.sh` beside this script — it runs INSIDE the
@@ -145,10 +157,11 @@ TEMPLATE="${TEMPLATE:-}"              # e.g. local:vztmpl/debian-12-standard_...
 SSH_PUBKEY="${SSH_PUBKEY:-}"           # optional override; empty = managed keypair
 SSH_KEY_FILE="${SSH_KEY_FILE:-/root/.vibe-sandbox-ssh}"   # host-side keypair (permanent)
 MAC_FILE="${MAC_FILE:-/root/.vibe-sandbox.mac}"  # host-side MAC store (permanent)
+STUB_MARKER="${STUB_MARKER:-/root/.vibe-sandbox.pristine-stub}"  # "the stopped CT has never booted"
 CT_MAC="${CT_MAC:-}"                   # optional override; empty = managed MAC
 SECRETS_FILE="${SECRETS_FILE:-/root/.vibe-sandbox.env}"   # host-side key store
 HOOK="${HOOK:-on}"                    # on = attach PVE hookscript (GUI trap)
-CLOBBER="${CLOBBER:-discard}"         # discard | zero | off — post-stop rootfs wipe
+CLOBBER="${CLOBBER:-discard}"         # discard | zero | off - post-stop rootfs wipe
 SANDBOX_TAG="${SANDBOX_TAG:-vibe-sandbox}"   # ownership tag; guard_ct() enforces it
 HOOK_VOL_ID="local:snippets/vibe-sandbox-hook.sh"
 HOOK_SNIPPET_DIR="${HOOK_SNIPPET_DIR:-/var/lib/vz/snippets}"
@@ -171,6 +184,7 @@ VIBE_AUTO_APPROVE="${VIBE_AUTO_APPROVE:-off}"   # off = disable auto-approve/YOL
 FIREWALL="${FIREWALL:-on}"            # on = attach PVE firewall=1 and write per-CT rules; off = skip
 EGRESS_POLICY="${EGRESS_POLICY:-lan-block}"     # lan-block | strict | off
 EGRESS_ALLOW="${EGRESS_ALLOW:-}"      # optional comma-separated IPs/CIDRs allowed outbound
+EGRESS_DENY="${EGRESS_DENY:-}"        # extra CIDRs lan-block drops: your site's PUBLIC IPv6 range(s)
 FW_DIR="${FW_DIR:-/etc/pve/firewall}" # Proxmox firewall config dir (contains cluster.fw & <CTID>.fw)
 
 # --------------------------- helpers ---------------------------------------
@@ -196,7 +210,7 @@ hook_lock() {   # $1 = phase; rc 0 = lock acquired (do the work), rc 1 = passthr
   if flock -n 9; then
     return 0
   fi
-  echo "vibe-sandbox: operation in progress — $1 hook passthrough" >&2
+  echo "vibe-sandbox: operation in progress - $1 hook passthrough" >&2
   return 1
 }
 
@@ -234,14 +248,33 @@ install_current_script() {   # $1 = temp file holding the new script; echoes bac
   echo "${self}.bak"
 }
 
+# A copy inside a git checkout is updated with `git pull`: self-update
+# would rewrite a tracked file and leave a .bak beside it, so a later pull
+# conflicts. Detected by a .git entry in the script's directory or above
+# (no dependency on git being installed on the host).
+script_git_checkout() {   # echoes the checkout root, rc 0 when inside one
+  local d
+  d="$(dirname "$(readlink -f "$0")")"
+  while [ -n "$d" ] && [ "$d" != "/" ]; do
+    [ -e "$d/.git" ] && { echo "$d"; return 0; }
+    d="$(dirname "$d")"
+  done
+  return 1
+}
+
 self_check() {   # "$@" = full original argv; installs + re-execs once if stale
   [ "$AUTO_UPDATE" = "on" ] || return 0
   [ -z "${VIBE_SANDBOX_SELF_UPDATED:-}" ] || return 0
+  local repo
+  if repo="$(script_git_checkout)"; then
+    echo "self-check: skipped - running from the git checkout at $repo (update it with git pull)"
+    return 0
+  fi
   local tmp bak
-  tmp="$(mktemp 2>/dev/null)" || { echo "self-check: mktemp failed — skipping" >&2; return 0; }
+  tmp="$(mktemp 2>/dev/null)" || { echo "self-check: mktemp failed - skipping" >&2; return 0; }
   if ! fetch_current_script "$tmp" 15; then
     rm -f "$tmp"
-    echo "self-check: could not fetch/validate $RAW_URL — continuing with the current script" >&2
+    echo "self-check: could not fetch/validate $RAW_URL - continuing with the current script" >&2
     return 0
   fi
   if [ "$(sha256sum "$(readlink -f "$0")" | awk '{print $1}')" = "$(sha256sum "$tmp" | awk '{print $1}')" ]; then
@@ -249,7 +282,7 @@ self_check() {   # "$@" = full original argv; installs + re-execs once if stale
     return 0
   fi
   bak="$(install_current_script "$tmp")"
-  echo "self-update: local script was stale — installed the current copy from main"
+  echo "self-update: local script was stale - installed the current copy from main"
   echo "  (previous copy: $bak); re-running on the new script"
   export VIBE_SANDBOX_SELF_UPDATED=1
   exec "$(readlink -f "$0")" "$@"
@@ -291,7 +324,7 @@ ensure_mac() {
     echo "generated sandbox MAC (retained on host): $CT_MAC"
   fi
   echo "$CT_MAC" | grep -Eq '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$' \
-    || die "invalid MAC '$CT_MAC' in $MAC_FILE — delete the file or set CT_MAC"
+    || die "invalid MAC '$CT_MAC' in $MAC_FILE - delete the file or set CT_MAC"
 }
 
 # Auto-deploy the PVE hookscript shim (idempotent). The shim only forwards
@@ -301,7 +334,7 @@ ensure_hook_snippet() {
   local self
   self="$(readlink -f "$0")"
   mkdir -p "$HOOK_SNIPPET_DIR"
-  printf '#!/usr/bin/env bash\n# vibe-sandbox PVE hookscript shim — auto-generated, safe to overwrite\nvmid="$1"; phase="$2"\nexec %q hook "$vmid" "$phase"\n' \
+  printf '#!/usr/bin/env bash\n# vibe-sandbox PVE hookscript shim - auto-generated, safe to overwrite\nvmid="$1"; phase="$2"\nexec %q hook "$vmid" "$phase"\n' \
     "$self" > "${HOOK_SNIPPET_DIR}/vibe-sandbox-hook.sh"
   chmod +x "${HOOK_SNIPPET_DIR}/vibe-sandbox-hook.sh"
 }
@@ -321,6 +354,28 @@ template_auto() {
   # stays visible live.
   pveam list local 2>/dev/null | grep -q "${t##*/}" || pveam download local "$t" >&2
   echo "local:vztmpl/${t##*/}"
+}
+
+# Run a command inside the CT with a fixed, clean root environment.
+# `pct exec` (lxc-attach) passes the CALLER's environment into the CT:
+# from a shell that is your HOME/LANG/exported overrides, from a PVE
+# hookscript it is almost nothing (no HOME - the Vibe installer dies on
+# that under set -u). Either way builds would differ by how they were
+# started; env -i makes CLI `up` and GUI Start provision identically.
+CT_ENV=(env -i HOME=/root USER=root LOGNAME=root SHELL=/bin/bash TERM=dumb
+  LANG=C.UTF-8 PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin)
+ct_run() { pct exec "$CTID" -- "${CT_ENV[@]}" "$@"; }
+
+# Copy a host file into the CT as root:root with the given mode, creating
+# the destination directory. Streams the file through `pct exec` (stdin)
+# rather than `pct push`: push takes the CT's config lock, which Proxmox
+# holds for the whole Start task - post-start hook included - so a push
+# from GUI-Start provisioning times out. exec goes straight to lxc-attach.
+# The file is created under umask 077 and only then given its final mode,
+# so a secret is never briefly world-readable.
+ct_push_file() {   # $1 = host src, $2 = CT dest path, $3 = octal mode
+  ct_run sh -c 'umask 077 && mkdir -p "$(dirname "$1")" && cat > "$1" && chown root:root "$1" && chmod "$2" "$1"' \
+    sh "$2" "$3" < "$1"
 }
 
 ct_exists()  { pct status "$CTID" >/dev/null 2>&1; }
@@ -353,7 +408,7 @@ wait_for_ip() {
 
 sandbox_work_findings() {   # echoes findings for a running CT; empty = clean
   ct_running || return 0
-  pct exec "$CTID" -- bash -c '
+  ct_run bash -c '
     command -v git >/dev/null 2>&1 || exit 0
     find /root /home -maxdepth 4 -type d -name .git 2>/dev/null |
     while IFS= read -r g; do
@@ -523,7 +578,7 @@ guard_ct() {
   fi
   # legacy sandbox from before tagging: our hostname AND our hookscript
   if [ "$hostname" = "$CTHOST" ] && echo "$cfg" | grep -q "^hookscript: ${HOOK_VOL_ID}$"; then
-    echo "guard: untagged legacy sandbox found — tagging CT $CTID as '$SANDBOX_TAG'"
+    echo "guard: untagged legacy sandbox found - tagging CT $CTID as '$SANDBOX_TAG'"
     pct set "$CTID" --tags "${tags:+${tags};}${SANDBOX_TAG}"
     return 0
   fi
@@ -533,6 +588,7 @@ guard_ct() {
 destroy_sandbox() {
   guard_ct   # ownership interlock: never destroy a CT that is not ours
   work_guard destroy || die "work guard: refusing to destroy CT $CTID"
+  clear_stub_marker   # whatever comes next is not the parked stub
   if ct_exists; then
     ct_running && pct stop "$CTID"
     pct destroy "$CTID" --purge
@@ -607,17 +663,23 @@ validate_hardening_config() {
     lan-block|strict|off) ;;
     *) die "invalid EGRESS_POLICY='$EGRESS_POLICY' (expected 'lan-block', 'strict', or 'off')" ;;
   esac
-  if [ -n "$EGRESS_ALLOW" ]; then
-    local saved_ifs="$IFS" entry
-    IFS=','
-    for entry in $EGRESS_ALLOW; do
-      IFS="$saved_ifs"
-      entry="$(printf '%s' "$entry" | tr -d ' \t')"
-      [ -n "$entry" ] || continue
-      validate_cidr_or_ip "$entry" || die "invalid IP/CIDR '$entry' in EGRESS_ALLOW"
-    done
+  local var entry
+  for var in EGRESS_ALLOW EGRESS_DENY; do
+    while IFS= read -r entry; do
+      validate_cidr_or_ip "$entry" || die "invalid IP/CIDR '$entry' in $var"
+    done < <(csv_entries "${!var}")
+  done
+}
+
+csv_entries() {   # $1 = comma-separated list; prints one trimmed entry per line
+  local saved_ifs="$IFS" entry
+  IFS=','
+  for entry in $1; do
     IFS="$saved_ifs"
-  fi
+    entry="$(printf '%s' "$entry" | tr -d ' \t')"
+    [ -n "$entry" ] && printf '%s\n' "$entry"
+  done
+  IFS="$saved_ifs"
 }
 
 bool_toml() {
@@ -638,10 +700,28 @@ datacenter_firewall_enabled() {
   ' "$cluster_fw" 2>/dev/null
 }
 
+# lan-block's built-in ranges are all private; a sandbox holding a PUBLIC
+# IPv6 address can reach your LAN devices' public IPv6 addresses unless
+# EGRESS_DENY lists your site's range. Warn when that gap is open.
+warn_public_ipv6() {
+  [ "$FIREWALL" = "on" ] && [ "$EGRESS_POLICY" = "lan-block" ] || return 0
+  [ -z "$EGRESS_DENY" ] || return 0
+  local addrs first suggest=""
+  addrs="$(ct_run ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}' | sort -u)"
+  [ -n "$addrs" ] || return 0
+  first="$(head -n1 <<<"$addrs")"
+  [[ "$first" =~ ^([0-9a-fA-F]{1,4}:[0-9a-fA-F]{1,4}:[0-9a-fA-F]{1,4}): ]] && suggest="${BASH_REMATCH[1]}::/48"
+  echo "warning: the sandbox has public IPv6 address(es):"
+  sed 's/^/    /' <<<"$addrs"
+  echo "  lan-block only drops private ranges, so your LAN devices' public IPv6 addresses are reachable."
+  echo "  set your site's delegated prefix and rebuild, e.g.:"
+  echo "    EGRESS_DENY=${suggest:-<your ISP-delegated IPv6 prefix>} $0 up"
+}
+
 warn_datacenter_firewall() {
   firewall_active || return 0
   datacenter_firewall_enabled && return 0
-  echo "warning: Proxmox Datacenter firewall is disabled (${FW_DIR}/cluster.fw) — per-CT egress rules in ${FW_DIR}/${CTID}.fw are NOT enforced yet." >&2
+  echo "warning: Proxmox Datacenter firewall is disabled (${FW_DIR}/cluster.fw) - per-CT egress rules in ${FW_DIR}/${CTID}.fw are NOT enforced yet." >&2
   echo "  to enable safely: ensure host SSH (22) & PVE UI (8006) access, then set Datacenter > Firewall > Options > Firewall: Yes." >&2
 }
 
@@ -662,18 +742,19 @@ OUT ACCEPT -p udp -sport 68 -dport 67 -log nolog # DHCP client
 OUT ACCEPT -p udp -dport 53 -log nolog # DNS (UDP)
 OUT ACCEPT -p tcp -dport 53 -log nolog # DNS (TCP)
 EOF
-  if [ -n "$EGRESS_ALLOW" ]; then
-    local saved_ifs="$IFS" entry
-    IFS=','
-    for entry in $EGRESS_ALLOW; do
-      IFS="$saved_ifs"
-      entry="$(printf '%s' "$entry" | tr -d ' \t')"
-      [ -n "$entry" ] || continue
-      printf 'OUT ACCEPT -dest %s -log nolog # EGRESS_ALLOW\n' "$entry"
-    done
-    IFS="$saved_ifs"
-  fi
+  local entry
+  while IFS= read -r entry; do
+    printf 'OUT ACCEPT -dest %s -log nolog # EGRESS_ALLOW\n' "$entry"
+  done < <(csv_entries "$EGRESS_ALLOW")
   if [ "$EGRESS_POLICY" = "lan-block" ]; then
+    # Your LAN is not only RFC1918: with native IPv6, every device also has
+    # a PUBLIC address in the ISP-delegated prefix, which no private-range
+    # rule matches. EGRESS_DENY carries that range (e.g. your /48). It
+    # comes after EGRESS_ALLOW, so a single allowed host inside it still
+    # gets through.
+    while IFS= read -r entry; do
+      printf 'OUT DROP -dest %s -log nolog # EGRESS_DENY (site range)\n' "$entry"
+    done < <(csv_entries "$EGRESS_DENY")
     cat <<'EOF'
 OUT DROP -dest 10.0.0.0/8 -log nolog # block RFC1918 LAN
 OUT DROP -dest 172.16.0.0/12 -log nolog # block RFC1918 LAN
@@ -697,7 +778,7 @@ configure_firewall() {
     return 0
   fi
   if [ -f "$fw_file" ] && ! grep -qF "$FW_MARKER" "$fw_file" 2>/dev/null; then
-    die "refusing to overwrite unmanaged firewall ruleset at $fw_file — remove it or set FIREWALL=off"
+    die "refusing to overwrite unmanaged firewall ruleset at $fw_file - remove it or set FIREWALL=off"
   fi
   mkdir -p "$FW_DIR"
   # Atomic same-directory rename avoids partial writes on pmxcfs (/etc/pve)
@@ -730,19 +811,17 @@ EOF
 
 inject_vibe_config() {
   if [ "$VIBE_HARDEN" != "on" ]; then
-    echo "hardening: VIBE_HARDEN=off — skipping /root/.vibe/config.toml injection"
+    echo "hardening: VIBE_HARDEN=off - skipping /root/.vibe/config.toml injection"
     return 0
   fi
   local cfg_tmp
   cfg_tmp="$(mktemp)"
   render_vibe_config > "$cfg_tmp"
-  if ! pct exec "$CTID" -- mkdir -p /root/.vibe || ! pct push "$CTID" "$cfg_tmp" /root/.vibe/config.toml; then
+  if ! ct_push_file "$cfg_tmp" /root/.vibe/config.toml 400; then
     rm -f "$cfg_tmp"
-    return 1
+    die "hardening: failed to inject /root/.vibe/config.toml"
   fi
   rm -f "$cfg_tmp"
-  pct exec "$CTID" -- chown root:root /root/.vibe/config.toml
-  pct exec "$CTID" -- chmod 400 /root/.vibe/config.toml
   echo "hardening: injected /root/.vibe/config.toml (connectors=$VIBE_CONNECTORS, mcp=$VIBE_MCP, auto_approve=$VIBE_AUTO_APPROVE)"
 }
 
@@ -801,14 +880,18 @@ clobber_disk() {
   dev="$(pvesm path "$volid" 2>/dev/null || true)"
   case "$dev" in
     /dev/*) ;;
-    *) echo "clobber: $volid is not /dev-backed ($dev) — skipping wipe" >&2; return 0 ;;
+    *) echo "clobber: $volid is not /dev-backed ($dev) - skipping wipe" >&2; return 0 ;;
   esac
   if [ "$CLOBBER" = "zero" ]; then
     echo "clobber: zero-filling $dev ..."
     dd if=/dev/zero of="$dev" bs=1M status=none || true
   else
-    blkdiscard "$dev" 2>/dev/null \
-      || echo "clobber: blkdiscard failed on $dev (rotational disk? use CLOBBER=zero)" >&2
+    # -f is required: util-linux >= 2.36 refuses a device that still holds
+    # a filesystem signature (the rootfs always does) whenever stdin is a
+    # terminal, so an interactive `down` would silently skip the wipe.
+    local err
+    err="$(blkdiscard -f "$dev" 2>&1)" \
+      || echo "clobber: blkdiscard failed on $dev: ${err:-unknown error} - set CLOBBER=zero to overwrite instead" >&2
   fi
 }
 
@@ -822,6 +905,40 @@ park_sandbox() {
   [ -n "$TEMPLATE" ] || TEMPLATE="$(template_auto)"
   ensure_hook_snippet
   create_sandbox stopped
+  mark_stub_pristine
+}
+
+# Pristine-stub marker. GUI Start cannot rebuild the CT: Proxmox holds the
+# CT's config lock (/run/lock/lxc/pve-config-<CTID>.lock) for the whole
+# Start task, pre-start hook included, so any pct destroy/create from the
+# hook waits on its own task and times out. Instead, every park (down, GUI
+# Stop) leaves a freshly created, never-booted stub and records that here;
+# pre-start only lets a stub carrying this mark boot. The mark lives on
+# the host (survives a host reboot) and is cleared by any destroy and by
+# pre-start itself, so a disk that has ever booted never counts as fresh.
+mark_stub_pristine() {
+  mkdir -p "$(dirname "$STUB_MARKER")"
+  printf '%s\n' "$CTID" > "$STUB_MARKER"
+}
+
+clear_stub_marker() { rm -f "$STUB_MARKER"; }
+
+stub_is_pristine() {
+  [ -f "$STUB_MARKER" ] && [ "$(cat "$STUB_MARKER" 2>/dev/null)" = "$CTID" ] \
+    && ct_exists && ! ct_running
+}
+
+# The stub's net0 firewall flag was fixed when it was parked; if FIREWALL or
+# EGRESS_POLICY changed since, the CT config would need editing, which
+# pre-start cannot do under Proxmox's lock.
+stub_firewall_consistent() {
+  local net0
+  net0="$(pct config "$CTID" 2>/dev/null | awk '/^net0:/ {print $2}')"
+  if firewall_active; then
+    [[ ",${net0}," == *",firewall=1,"* ]]
+  else
+    [[ ",${net0}," != *",firewall=1,"* ]]
+  fi
 }
 
 # Base provisioning script, executed INSIDE the fresh CT on every build.
@@ -833,27 +950,20 @@ provision_base_script() {
 #!/usr/bin/env bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
-# headless-clean locale for apt/perl: the host's LANG leaks into the CT
-# through pct exec (lxc-attach passes the calling environment) and is
-# usually not compiled into the fresh CT, so apt/perl would spam
-# warnings; use C here
+# runs under ct_run's clean environment (HOME=/root, LANG=C.UTF-8, PATH
+# with /root/.local/bin first, where uv installs the Vibe CLI); the C
+# locale keeps apt/perl quiet in a fresh CT
 export LC_ALL=C
-# uv installs the CLI into /root/.local/bin, which is NOT on the PATH
-# of the pct-exec context — the installer treats that as fatal, and
-# `vibe --version` below would fail the same way — so put it up front
 export PATH="/root/.local/bin:$PATH"
 
-# general-purpose baseline: the agent extends this at runtime as needed
+# general-purpose baseline: the agent extends this at runtime as needed.
+# Dpkg::Use-Pty=0: no "(Reading database ... 5%" redraws, which the PVE
+# task log would show as one line each
 apt-get update -qq
-apt-get install -y -qq --no-install-recommends \
+apt-get install -y -qq --no-install-recommends -o Dpkg::Use-Pty=0 \
   ca-certificates curl wget git build-essential \
   python3 python3-pip python3-venv \
   unzip zip jq ripgrep man-db sudo locales || true
-
-# generate the locale that leaked in from the host (now that the
-# `locales` package is installed): subsequent pct exec calls stop
-# warning and the CT matches the host, whatever LANG says
-[ -n "${LANG:-}" ] && locale-gen "$LANG" >/dev/null 2>&1 || true
 
 # current iteration of Mistral tooling, fetched at build time
 curl -LsSf https://mistral.ai/vibe/install.sh | bash
@@ -880,16 +990,14 @@ EOF
 # take precedence over it, but the sandbox sets none, so this is the source.
 inject_credentials() {
   if [ ! -f "$SECRETS_FILE" ]; then
-    echo "warning: no key store at $SECRETS_FILE — CLI will need the setup wizard" >&2
+    echo "warning: no key store at $SECRETS_FILE - CLI will need the setup wizard" >&2
     echo "  create a key at chat.mistral.ai (Code > Vibe CLI), then run:" >&2
     echo "    printf 'MISTRAL_API_KEY=<key>\n' > $SECRETS_FILE && chmod 600 $SECRETS_FILE" >&2
     return 0
   fi
   [ "$(stat -c %a "$SECRETS_FILE")" = "600" ] || chmod 600 "$SECRETS_FILE"
-  pct exec "$CTID" -- mkdir -p /root/.vibe
-  pct push "$CTID" "$SECRETS_FILE" /root/.vibe/.env
-  pct exec "$CTID" -- chown root:root /root/.vibe/.env
-  pct exec "$CTID" -- chmod 600 /root/.vibe/.env
+  ct_push_file "$SECRETS_FILE" /root/.vibe/.env 600 \
+    || die "failed to inject credentials into CT $CTID"
   echo "credentials injected (host: $SECRETS_FILE -> CT: /root/.vibe/.env)"
 }
 
@@ -899,8 +1007,8 @@ provision_and_report() {
   local prov
   prov="$(mktemp)"
   provision_base_script > "$prov"
-  pct push "$CTID" "$prov" /root/provision-base.sh
-  pct exec "$CTID" -- bash /root/provision-base.sh
+  ct_push_file "$prov" /root/provision-base.sh 700
+  ct_run bash /root/provision-base.sh
   rm -f "$prov"
 
   # permanent credential store -> fresh CT, every build
@@ -911,8 +1019,9 @@ provision_and_report() {
 
   # user hook (deterministic per-use extras), if present
   if [ -f "$PROVISION_HOOK" ]; then
-    pct push "$CTID" "$PROVISION_HOOK" /root/provision.sh
-    pct exec "$CTID" -- bash /root/provision.sh
+    echo "running user provisioning hook $PROVISION_HOOK ..."
+    ct_push_file "$PROVISION_HOOK" /root/provision.sh 700
+    ct_run bash /root/provision.sh
   fi
 }
 
@@ -923,6 +1032,7 @@ print_ssh_line() {
   else
     echo "  ssh root@${ip}"
   fi
+  echo "  (or on this host: $(readlink -f "$0") ssh)"
 }
 
 # Every rebuild mints a fresh SSH host key, so a stale known_hosts
@@ -959,6 +1069,7 @@ cmd_up() {
 
   provision_and_report
   print_hardening_summary
+  warn_public_ipv6
   warn_datacenter_firewall
 
   echo "sandbox ready."
@@ -1042,13 +1153,13 @@ The keypair is permanent: one export unlocks every future rebuild.
 
 FIX THE IP (recommended)
 ------------------------
-  The sandbox MAC is also permanent — retained on the host across
-  rebuilds — so reserve the IP for it on your DHCP server (router,
+  The sandbox MAC is also permanent - retained on the host across
+  rebuilds - so reserve the IP for it on your DHCP server (router,
   pfSense/OPNsense, Pi-hole, whatever hands out addresses):
     ${mac:-unknown}
   With that reservation, the IP below never goes stale and 'ssh
   vibe-sandbox' just works after every rebuild. Without it, only the
-  HostName (IP) goes stale per rebuild — re-run 'export' on the host and
+  HostName (IP) goes stale per rebuild - re-run 'export' on the host and
   re-fetch, or edit the HostName line in your ssh config.
 
 Current sandbox IP: $ip
@@ -1078,7 +1189,7 @@ REBUILDS AND HOST KEYS
   for this one Host, so 'ssh vibe-sandbox' just works after every rebuild.
   (Windows OpenSSH maps /dev/null to NUL; if your ssh rejects the line,
   write NUL there instead.) With a hand-rolled config, expect REMOTE HOST
-  IDENTIFICATION HAS CHANGED after each rebuild — expected rotation,
+  IDENTIFICATION HAS CHANGED after each rebuild - expected rotation,
   not an attack; recover and reconnect:
     ssh-keygen -R $ip
 
@@ -1087,12 +1198,12 @@ PuTTY instead of OpenSSH
   puttygen "%USERPROFILE%\.ssh\vibe-sandbox" -o vibe-sandbox.ppk
   Host Name: $ip   Port: 22   User: root
   (load vibe-sandbox.ppk under Connection > SSH > Auth > Credentials)
-  (each rebuild mints a fresh host key — accept it when PuTTY asks)
+  (each rebuild mints a fresh host key - accept it when PuTTY asks)
 
 Security
 --------
   The private key now also lives on this desktop. It is a dedicated
-  sandbox keypair — it unlocks the sandbox (every future rebuild too),
+  sandbox keypair - it unlocks the sandbox (every future rebuild too),
   not the Proxmox host. After fetching the tarball, delete the host-side
   copy so the key lives only on host and desktop:
     rm -rf $EXPORT_DIR
@@ -1106,21 +1217,22 @@ EOF
   echo "  fetch from your desktop (host SSH must be reachable from your LAN):"
   echo "    scp root@${hostip}:$EXPORT_DIR/vibe-sandbox-desktop.tar.gz ."
   if [ "$(hostname -I | wc -w)" -gt 1 ]; then
-    echo "  note: this host is multi-homed ($(hostname -I | awk '{$1=$1};1')) —"
+    echo "  note: this host is multi-homed ($(hostname -I | awk '{$1=$1};1')) -"
     echo "  if $hostip is not reachable from your desktop, rerun with:"
     echo "    HOST_IP=<reachable-address> $0 export"
   fi
   echo "  then follow the README.txt inside; connect with: ssh vibe-sandbox"
-  echo "recommended: set a DHCP reservation for the sandbox MAC ${mac:-unknown} —"
+  echo "recommended: set a DHCP reservation for the sandbox MAC ${mac:-unknown} -"
   echo "  it is retained across rebuilds, so the IP stays stable forever"
-  echo "note: without a reservation, re-run 'export' after each rebuild — only the IP changes; the key is permanent"
+  echo "note: without a reservation, re-run 'export' after each rebuild - only the IP changes; the key is permanent"
   echo "note: rebuilds mint a fresh host key; the bundled ssh-config pins"
   echo "  StrictHostKeyChecking no for the sandbox Host, so desktop connects survive rebuilds"
 }
 
 # INTERNAL: entry point for the PVE hookscript shim. PVE calls the shim with
 # (vmid, phase); the shim execs this. Phases:
-#   pre-start  — destroy + recreate fresh, stopped; PVE then boots the NEW CT
+#   pre-start  — allow the boot only if the CT is a pristine stub (see
+#                mark_stub_pristine); otherwise abort the Start
 #   post-start — wait for IP, provision, log the ssh line
 #   pre-stop   — work guard: refuse stops that would lose unextracted work
 #   post-stop  — clobber + park stub
@@ -1133,26 +1245,35 @@ EOF
 # does the work itself, this hook passes through with exit 0.
 cmd_hook() {
   local vmid="${1:-}" phase="${2:-}"
+  # One stream for the PVE task log: it reads stdout and stderr separately,
+  # so warnings otherwise land out of order (after "ready via GUI").
+  exec 2>&1
   [ "$vmid" = "$CTID" ] || exit 0
   case "$phase" in
     pre-start)
+      # Runs INSIDE Proxmox's Start task, under the CT's config lock: no
+      # pct destroy/create/set on this CT from here (they would time out
+      # on that lock). Boot only a pristine stub left by down / GUI Stop;
+      # anything else aborts the Start (non-zero exit) with directions.
       self_check hook "$vmid" "$phase"
       hook_lock "$phase" || exit 0
       validate_hardening_config
-      echo "pre-start: rebuilding CT $CTID fresh"
-      destroy_sandbox
-      ensure_ssh_key
-      [ -n "$TEMPLATE" ] || TEMPLATE="$(template_auto)"
-      ensure_hook_snippet
-      create_sandbox stopped
-      ;;  # PVE now starts the newly created CT
+      guard_ct
+      stub_is_pristine || die "pre-start: CT $CTID is not a fresh stub (it has booted since it was built, or was not parked by 'down' / GUI Stop). GUI Start cannot rebuild it, because Proxmox holds the CT's lock during Start. On the host, run: $0 up"
+      stub_firewall_consistent || die "pre-start: firewall settings changed since CT $CTID was parked (FIREWALL=$FIREWALL, EGRESS_POLICY=$EGRESS_POLICY). On the host, run: $0 up"
+      configure_firewall   # refresh the host-side ruleset (a file under /etc/pve/firewall, not the CT config)
+      clear_stub_marker    # booting now: from here on this is a used disk
+      echo "pre-start: CT $CTID is a fresh, never-booted stub - starting it"
+      ;;  # PVE now boots the stub; post-start provisions it
     post-start)
       hook_lock "$phase" || exit 0
+      guard_ct
       local ip
       ip="$(wait_for_ip)" || { echo "post-start: no IP (check ${BRIDGE}/DHCP)"; exit 0; }
       purge_known_hosts "$ip"
       provision_and_report
       print_hardening_summary
+      warn_public_ipv6
       warn_datacenter_firewall
       echo "sandbox ready via GUI."
       print_ssh_line "$ip"
@@ -1188,9 +1309,24 @@ cmd_status() {
   if ! ct_exists; then echo "no sandbox (CT $CTID absent)"; exit 0; fi
   if ct_running; then
     echo "CT $CTID running, ip: $(sandbox_ip), firewall: ${fw_info}"
+  elif stub_is_pristine; then
+    echo "CT $CTID stopped: fresh stub, ready for GUI Start, firewall: ${fw_info}"
   else
-    echo "CT $CTID exists but stopped (stub or unprovisioned), firewall: ${fw_info}"
+    echo "CT $CTID stopped: NOT a fresh stub (GUI Start will refuse; run '$0 up'), firewall: ${fw_info}"
   fi
+}
+
+# ssh into the sandbox with the managed key: `ssh [command...]`.
+# Host keys rotate on every rebuild; build paths purge the stale
+# known_hosts entry, and accept-new records the fresh key on first use
+# (a key CHANGING under a live sandbox would still be refused).
+cmd_ssh() {   # "$@" = optional remote command
+  ct_running || die "sandbox not running; run 'up' first"
+  local ip keyargs=()
+  ip="$(sandbox_ip)"
+  [ -n "$ip" ] || die "no IP for the sandbox (check ${BRIDGE}/DHCP)"
+  [ -z "$SSH_PUBKEY" ] && keyargs=(-i "$SSH_KEY_FILE" -o IdentitiesOnly=yes)
+  exec ssh "${keyargs[@]}" -o StrictHostKeyChecking=accept-new "root@${ip}" "$@"
 }
 
 cmd_shell() {
@@ -1203,7 +1339,10 @@ cmd_shell() {
 # no-op is quiet.
 cmd_update() {
   [ "$EUID" -eq 0 ] || die "must run as root on the Proxmox host"
-  local self tmp bak
+  local self tmp bak repo
+  if repo="$(script_git_checkout)"; then
+    die "this copy lives in the git checkout at $repo - update it with: git -C $repo pull"
+  fi
   self="$(readlink -f "$0")"
   tmp="$(mktemp)" || die "mktemp failed"
   fetch_current_script "$tmp" 60 || die "could not fetch/validate $RAW_URL"
@@ -1225,6 +1364,7 @@ case "${1:-}" in
   status) shift; cmd_status ;;
   ip)     sandbox_ip ;;
   shell)  shift; cmd_shell ;;
+  ssh)    shift; cmd_ssh "$@" ;;
   export) shift; cmd_export ;;
   update)  shift; cmd_update ;;
   hook)   shift; cmd_hook "$@" ;;

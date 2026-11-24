@@ -14,7 +14,7 @@
 #               root by default, and the host reachable from your LAN)
 # Optional env overrides (set before running):
 #   PVE_SCRIPT  path of vibe-sandbox.sh on the host (default /root/vibe-sandbox.sh)
-#   PVE_KEY     path of the managed sandbox private key on the host (default /root/vibe-sandbox-ssh)
+#   PVE_KEY     path of the managed sandbox private key on the host (default /root/.vibe-sandbox-ssh)
 #   SSH_ALIAS   desktop ssh alias for the sandbox (default vibe-sandbox)
 #
 # Per run: same flow as vscode-connect.sh. See that script's header or the
@@ -22,7 +22,7 @@
 
 $PveHost   = "$(if ($env:PVE_HOST)   { $env:PVE_HOST }   else { '' })"
 $PveScript = "$(if ($env:PVE_SCRIPT) { $env:PVE_SCRIPT } else { '/root/vibe-sandbox.sh' })"
-$PveKey    = "$(if ($env:PVE_KEY)    { $env:PVE_KEY }    else { '/root/vibe-sandbox-ssh' })"
+$PveKey    = "$(if ($env:PVE_KEY)    { $env:PVE_KEY }    else { '/root/.vibe-sandbox-ssh' })"
 $SshAlias  = "$(if ($env:SSH_ALIAS)  { $env:SSH_ALIAS }  else { 'vibe-sandbox' })"
 $Workspace = if ($args.Count -gt 0 -and $args[0]) { "$($args[0])" } else { '/root' }
 if (-not $Workspace.StartsWith('/')) { $Workspace = '/' + $Workspace }

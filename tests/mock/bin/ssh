@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Mock ssh: record the call only.
+echo "ssh $*" >> "${MOCK_T:?}/calls.log"

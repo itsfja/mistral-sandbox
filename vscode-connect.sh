@@ -13,7 +13,7 @@
 #               root by default, and the host reachable from your LAN)
 # Optional env overrides:
 #   PVE_SCRIPT  path of vibe-sandbox.sh on the host (default /root/vibe-sandbox.sh)
-#   PVE_KEY     path of the managed sandbox private key on the host (default /root/vibe-sandbox-ssh)
+#   PVE_KEY     path of the managed sandbox private key on the host (default /root/.vibe-sandbox-ssh)
 #   SSH_ALIAS   desktop ssh alias for the sandbox (default vibe-sandbox)
 #
 # Per run:
@@ -35,7 +35,7 @@ set -euo pipefail
 
 PVE_HOST="${PVE_HOST:-}"
 PVE_SCRIPT="${PVE_SCRIPT:-/root/vibe-sandbox.sh}"
-PVE_KEY="${PVE_KEY:-/root/vibe-sandbox-ssh}"
+PVE_KEY="${PVE_KEY:-/root/.vibe-sandbox-ssh}"
 SSH_ALIAS="${SSH_ALIAS:-vibe-sandbox}"
 WORKSPACE="${1:-/root}"
 SSH_DIR="$HOME/.ssh"
