@@ -112,6 +112,12 @@
 #                      EGRESS_ALLOW CIDRs/IPs; EGRESS_POLICY=off disables.
 #                      Enforced when Proxmox Datacenter firewall is enabled.
 #
+# Settings: every variable in the configuration block below can be set on
+# the command line for one run, or in /root/.vibe-sandbox.conf (CONFIG_FILE;
+# plain KEY=value lines, root-owned, never executed) for EVERY run. Use the
+# file for anything that must also hold for GUI Start/Stop: the PVE
+# hookscript runs without your shell's environment.
+#
 # Run ON the Proxmox host as root (uses `pct` / `pveam` / `pvesm`).
 # Tested syntax: PVE 8.x. Review flags against your version before first run.
 #
@@ -143,8 +149,46 @@
 
 set -euo pipefail
 
+# --------------------------- host config file --------------------------------
+# Settings that must hold for EVERY run go in $CONFIG_FILE (default
+# /root/.vibe-sandbox.conf): plain KEY=value lines, read but NEVER executed.
+# Exported variables only reach the CLI run they were set for; PVE runs the
+# GUI hookscript with an almost empty environment, so a GUI Stop or Start
+# would rebuild the stub and its firewall ruleset without them (e.g. a
+# missing EGRESS_DENY silently drops the site-range rule). The file is read
+# on every run, CLI and hook alike. Precedence: command-line env > file >
+# built-in default. Must be owned by root and not group/other-writable.
+CONFIG_FILE="${CONFIG_FILE:-/root/.vibe-sandbox.conf}"
+
+load_config_file() {   # $1 = path
+  local file="$1" line key val
+  [ -f "$file" ] || return 0
+  [ "$(stat -c %u "$file")" = "0" ] || { echo "error: refusing $file: not owned by root" >&2; exit 1; }
+  case "$(stat -c %a "$file")" in
+    *[2367]?|*?[2367]) echo "error: refusing $file: group/other-writable" >&2; exit 1 ;;
+  esac
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    case "$line" in ''|'#'*) continue ;; esac
+    [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Z][A-Z0-9_]*)=(.*)$ ]] \
+      || { echo "error: bad line in $file: $line" >&2; exit 1; }
+    key="${BASH_REMATCH[2]}"
+    val="${BASH_REMATCH[3]}"
+    case "$key" in
+      CONFIG_FILE|PATH|HOME) echo "error: $key cannot be set in $file" >&2; exit 1 ;;
+    esac
+    # strip one pair of matching surrounding quotes; no expansion, ever
+    if [[ "$val" =~ ^\"(.*)\"$ ]] || [[ "$val" =~ ^\'(.*)\'$ ]]; then
+      val="${BASH_REMATCH[1]}"
+    fi
+    # plain assignment, NOT export: config values stay on the host
+    [ -n "${!key+x}" ] || printf -v "$key" '%s' "$val"
+  done < "$file"
+}
+load_config_file "$CONFIG_FILE"
+
 # --------------------------- configuration ---------------------------------
-CTID="${CTID:-1042}"                 # fixed ID = only one sandbox ever exists
+CTID="${CTID:-1042}"               # fixed ID = only one sandbox ever exists
 CTHOST="${CTHOST:-vibe-sandbox}"
 CORES="${CORES:-4}"
 RAM_MB="${RAM_MB:-4096}"
@@ -386,8 +430,8 @@ sandbox_ip() {
 }
 
 wait_for_ip() {
-  local ip="" i
-  for i in $(seq 1 45); do
+  local ip="" _
+  for _ in $(seq 1 45); do
     ip="$(sandbox_ip)"
     [ -n "$ip" ] && { echo "$ip"; return 0; }
     sleep 2
@@ -714,8 +758,8 @@ warn_public_ipv6() {
   echo "warning: the sandbox has public IPv6 address(es):"
   sed 's/^/    /' <<<"$addrs"
   echo "  lan-block only drops private ranges, so your LAN devices' public IPv6 addresses are reachable."
-  echo "  set your site's delegated prefix and rebuild, e.g.:"
-  echo "    EGRESS_DENY=${suggest:-<your ISP-delegated IPv6 prefix>} $0 up"
+  echo "  add your site's delegated prefix to $CONFIG_FILE, then run '$0 up':"
+  echo "    EGRESS_DENY=${suggest:-<your ISP-delegated IPv6 prefix>}"
 }
 
 warn_datacenter_firewall() {
