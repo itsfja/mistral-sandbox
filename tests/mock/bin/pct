@@ -27,7 +27,9 @@ case "$cmd" in
     done ;;
   status)
     id="$1"; [ -e "$T/conf/$id.conf" ] || { echo "Configuration file 'nodes/pve/lxc/$id.conf' does not exist" >&2; exit 2; }
-    if [ -e "$T/run/$id" ]; then echo "status: running"; else echo "status: stopped"; fi ;;
+    # $T/stopping/<id>: PVE is mid-Stop (post-stop hook running) and, as on a
+    # real host, still reports the CT as running
+    if [ -e "$T/run/$id" ] || [ -e "$T/stopping/$id" ]; then echo "status: running"; else echo "status: stopped"; fi ;;
   config)
     id="$1"; [ -e "$T/conf/$id.conf" ] || exit 2; cat "$T/conf/$id.conf" ;;
   create)

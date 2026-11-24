@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Mock host systemctl: only `is-active [--quiet] <unit>`.
+#   vibe-sandbox-park-<id>   active while $MOCK_T/park-active exists
+#   pve-container@<id>       active while $MOCK_T/unit-active/<id> exists
+T="${MOCK_T:?}"
+echo "systemctl $*" >> "$T/calls.log"
+[ "$1" = is-active ] || { echo "mock systemctl: unhandled $1" >&2; exit 3; }
+unit="${*: -1}"
+case "$unit" in
+  vibe-sandbox-park-*) [ -e "$T/park-active" ] && exit 0 ;;
+  pve-container@*) [ -e "$T/unit-active/${unit#pve-container@}" ] && exit 0 ;;
+esac
+exit 3

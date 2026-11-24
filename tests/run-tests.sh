@@ -32,6 +32,21 @@ gui_hook() {   # $1 = vmid, $2 = phase, $3 = extra VAR=val; env-less like PVE
     bash -c "$(eval echo "$HOSTVARS") ${3:-} $S hook $1 $2" 2>&1
 }
 calls_lack() { ! grep -qE "$1" "$T/calls.log"; }
+run_deferred() {   # run the job post-stop handed to systemd-run, env-less like a unit
+  env -i PATH="$HERE/bin:/usr/bin:/bin" MOCK_T="$T" \
+    bash -c "$(eval echo "$HOSTVARS") ${1:-} $(cat "$T/deferred.cmd")" 2>&1
+}
+# A GUI Stop as PVE runs it: the CT has stopped, but `pct status` still says
+# running and the CT config lock is held until post-stop returns. Sets
+# STOP_OUT (hook output) and STOP_RC; the park job is left in deferred.cmd.
+gui_stop_hook() {
+  rm -f "$T/run/1042" "$T/deferred.cmd"
+  mkdir -p "$T/locked" "$T/stopping" "$T/unit-active"
+  touch "$T/locked/1042" "$T/stopping/1042" "$T/unit-active/1042"
+  : > "$T/calls.log"
+  STOP_OUT="$(gui_hook 1042 post-stop "${1:-}")"; STOP_RC=$?
+  rm -f "$T/locked/1042" "$T/stopping/1042" "$T/unit-active/1042"   # Stop task ends
+}
 
 echo "== up"
 fresh
@@ -111,9 +126,44 @@ check "  ...and keeps the stub pristine" [ -e "$T/host/pristine-stub" ]
 out="$(gui_hook 1042 pre-start)"; rc=$?
 check "  ...then starts with the original settings" [ $rc -eq 0 ]
 rm -f "$T/locked/1042"
-# GUI Stop: PVE has stopped the CT; post-stop parks a new stub
-out="$(gui_hook 1042 post-stop FORCE=1)"; rc=$?
-check "post-stop parks a fresh stub again" [ $rc -eq 0 ] && [ "$(cat "$T/host/pristine-stub" 2>/dev/null)" = 1042 ]
+
+echo "== GUI Stop: park deferred until Proxmox releases the CT"
+gui_stop_hook
+check "post-stop under the PVE lock exits 0" [ $STOP_RC -eq 0 ]
+[ $STOP_RC -eq 0 ] || echo "$STOP_OUT" | tail -5
+check "  ...without pct stop/destroy/create (they need the lock)" calls_lack '^pct (stop|destroy|create|set|push) '
+check "  ...schedules the park via systemd-run" grep -q "^systemd-run --unit vibe-sandbox-park-1042 .* park-deferred$" "$T/calls.log"
+check "  ...and says so in the task log" grep -q 'parking CT 1042 once Proxmox releases it' <<<"$STOP_OUT"
+check "  ...nothing parked yet" [ ! -e "$T/host/pristine-stub" ]
+touch "$T/park-active"; touch "$T/locked/1042"
+out="$(gui_hook 1042 pre-start)"; rc=$?
+check "Start while the park job runs is refused with directions" [ $rc -ne 0 ] && grep -q 'still being parked.*journalctl -u vibe-sandbox-park-1042' <<<"$out"
+rm -f "$T/locked/1042"
+out="$(run "$S" status 2>&1)"
+check "status says parking is in progress" grep -q 'being parked after GUI Stop' <<<"$out"
+rm -f "$T/park-active"
+# the job waits while PVE still has the CT's unit up
+touch "$T/unit-active/1042"; ( sleep 3; rm -f "$T/unit-active/1042" ) &
+: > "$T/calls.log"; start=$(date +%s)
+out="$(run_deferred FORCE=1)"; rc=$?
+check "park job exits 0" [ $rc -eq 0 ]
+[ $rc -eq 0 ] || echo "$out" | tail -5
+check "  ...waited for pve-container@1042 to go inactive" [ $(( $(date +%s) - start )) -ge 2 ]
+check "  ...clobbered via blkdiscard -f" grep -q '^blkdiscard -f /dev/mock/' "$T/calls.log"
+check "  ...parked a fresh stub, marked pristine" [ "$(cat "$T/host/pristine-stub" 2>/dev/null)" = 1042 ] && [ ! -e "$T/run/1042" ]
+check "  ...says it is ready for GUI Start" grep -q 'parked as a fresh stub - ready for GUI Start' <<<"$out"
+touch "$T/locked/1042"
+out="$(gui_hook 1042 pre-start)"; rc=$?
+check "GUI Start then boots the stub" [ $rc -eq 0 ] && grep -q 'fresh, never-booted stub' <<<"$out"
+rm -f "$T/locked/1042"
+# Stop, then the CT is started again (CLI up) before the job runs: leave it alone
+touch "$T/run/1042"; gui_stop_hook; touch "$T/run/1042"; : > "$T/calls.log"
+out="$(run_deferred)"
+check "park job leaves a CT that was started meanwhile alone" grep -q 'started again meanwhile - not parking' <<<"$out" && calls_lack '^pct (stop|destroy|create) '
+rm -f "$T/run/1042"
+run_deferred FORCE=1 >/dev/null   # parks the used CT
+: > "$T/calls.log"; out="$(run_deferred FORCE=1)"
+check "park job is a no-op on an already fresh stub" grep -q 'already a fresh stub' <<<"$out" && calls_lack '^pct (stop|destroy|create) '
 check "hook ignores other CTs" bash -c "[ -z \"\$1\" ]" _ "$(gui_hook 999 pre-start)"
 
 echo "== ownership guard"
@@ -154,9 +204,8 @@ check "  ...quoted value read (cores 2)" grep -q -- '--cores 2 ' "$T/calls.log"
 check "  ...values are never executed" [ ! -e "$T/pwned" ]
 run CORES=6 FORCE=1 RESCUE=0 "$S" up >/dev/null 2>&1
 check "command-line env beats the file (cores 6)" grep -q -- '--cores 6 ' "$T/calls.log"
-rm -f "$T/run/1042"
-out="$(gui_hook 1042 post-stop FORCE=1)"; rc=$?
-check "GUI Stop (empty env) parks a stub" [ $rc -eq 0 ] && [ -e "$T/host/pristine-stub" ]
+gui_stop_hook; out="$(run_deferred FORCE=1)"; rc=$?
+check "GUI Stop + park job (empty env) parks a stub" [ $STOP_RC -eq 0 ] && [ $rc -eq 0 ] && [ -e "$T/host/pristine-stub" ]
 check "  ...and the rewritten .fw keeps EGRESS_DENY" grep -q 'EGRESS_DENY' "$T/fw/1042.fw"
 mkdir -p "$T/locked"; touch "$T/locked/1042"
 out="$(gui_hook 1042 pre-start)"; rc=$?

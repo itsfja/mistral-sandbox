@@ -36,8 +36,9 @@ outbound internet access — without handing it your machine.
   DHCP server for that MAC: the reservation then holds for every future
   rebuild. Override with `CT_MAC`.
 - **GUI-trapped** — the Proxmox GUI drives the lifecycle: right-click
-  Stop = disk clobber + a freshly built, never-booted stub; Start = boot
-  that stub + provisioning; Restart = both. Implemented with a `pct`
+  Stop = disk clobber + a freshly built, never-booted stub (about a
+  minute after the Stop task ends); Start = boot that stub +
+  provisioning. Implemented with a `pct`
   hookscript, whose shim is auto-deployed on every run. `HOOK=off`
   disables it.
 - **Clobbered** — on stop, the rootfs is discarded (`CLOBBER=discard`,
@@ -488,8 +489,8 @@ the Proxmox GUI becomes the front end:
 
 ```mermaid
 flowchart TD
-    T["GUI: right-click Stop / Shutdown"] --> PR2["post-stop hook:<br/>guard + clobber rootfs + build fresh stub<br/>mark it pristine"]
-    R["GUI: right-click Restart"] --> PR2
+    T["GUI: right-click Stop / Shutdown"] --> PR1["post-stop hook:<br/>schedule park job, return"]
+    PR1 --> PR2["park job (systemd unit, after the Stop task ends):<br/>guard + clobber rootfs + build fresh stub<br/>mark it pristine"]
     PR2 --> S
     S["GUI: right-click Start"] --> PS1{"pre-start hook:<br/>guard; is the CT a<br/>pristine stub?"}
     PS1 -- yes --> PVEB["clear the mark;<br/>PVE boots the stub"]
@@ -500,8 +501,8 @@ flowchart TD
 | GUI action | What actually happens |
 | --- | --- |
 | Start | boots the stub the last Stop (or `down`) built, then provisions it; the Start task stays busy until provisioning finishes — open its log for the `ssh -i ...` line. Refused, with a pointer to `up`, if the stopped CT has ever booted or the firewall settings changed since it was parked |
-| Stop / Shutdown | rootfs clobbered (`CLOBBER`), CT replaced by a freshly built, never-booted stub, recorded in `/root/.vibe-sandbox.pristine-stub` (`STUB_MARKER`); the GUI keeps a Start-able object holding nothing from the session |
-| Restart | stop phases, then start phases: a fresh stub, booted |
+| Stop / Shutdown | the post-stop hook hands the park to a transient systemd unit, `vibe-sandbox-park-<CTID>`, and the Stop task ends. About a minute later that unit has clobbered the rootfs (`CLOBBER`) and replaced the CT with a freshly built, never-booted stub, recorded in `/root/.vibe-sandbox.pristine-stub` (`STUB_MARKER`). The GUI keeps a Start-able object holding nothing from the session. Progress: `journalctl -u vibe-sandbox-park-<CTID>`; `status` shows it too |
+| Restart | **not supported**: its Start half comes while the park is still running and is refused. Use Stop, wait for the park, then Start |
 | Snapshot / Clone / Migrate / Backup / Console | **not trappable** (no hook phase) — harmless, since the next Start purges everything, but they cannot be blocked per-CT |
 
 CLI and hooks coexist: a hook phase fires from *inside* the `pct` call
@@ -514,11 +515,16 @@ does the work. A hook phase therefore never aborts a CLI build with
 
 Honest caveats:
 
-- **Why the rebuild happens at Stop.** Proxmox holds the CT's config lock
-  (`/run/lock/lxc/pve-config-<CTID>.lock`) for the whole Start task,
-  hookscript `pre-start` and `post-start` included. Any `pct destroy`,
-  `create`, `set` or `push` from those phases waits on its own task and
-  times out. So pre-start only checks the stub and lets it boot, and
+- **Why no hook rebuilds the CT.** Proxmox holds the CT's config lock
+  (`/run/lock/lxc/pve-config-<CTID>.lock`) for the whole Start *and* Stop
+  tasks, every hookscript phase included, and `pct status` still reports
+  the CT as running during `post-stop`. Any `pct stop`, `destroy`,
+  `create`, `set` or `push` from a hook waits on its own task and times
+  out. So post-stop only schedules the park with `systemd-run` (a plain
+  background job would be killed with the container's cgroup), and the
+  park job waits until `pve-container@<CTID>` is inactive before touching
+  the CT. If the CT has been started again by then, it is left alone.
+  Pre-start only checks the stub and lets it boot, and
   post-start provisions with `pct exec` alone (files are streamed in over
   stdin, not `pct push`). Every in-CT command runs under
   `env -i HOME=/root ...`: PVE runs hookscripts with an almost empty
@@ -720,6 +726,16 @@ References:
   on a GUI Start (`hookscript error ... on pre-start`) — a script from
   before the GUI Start fix tried to rebuild the CT inside the Start task,
   which holds that lock. Update the script, then run `up` once.
+- `pre-start: CT <id> is still being parked after the last Stop` — the
+  park job from the last GUI Stop is still running (about a minute).
+  Wait, then Start again; follow it with
+  `journalctl -u vibe-sandbox-park-<CTID>`. GUI **Restart** always hits
+  this: use Stop, then Start.
+- A GUI Stop ends `OK` but a second `CT <id> - Stop` task fails with
+  `can't lock file ... pve-config-<id>.lock` and the next Start says
+  `not a fresh stub` — a script from before the deferred park: post-stop
+  tried to park inside the Stop task. Update the script, then run `down`
+  (or `up`) once.
 - `pre-start: CT <id> is not a fresh stub` on a GUI Start — the stopped
   CT has booted since it was built (or predates the pristine-stub mark).
   Run `/root/vibe-sandbox.sh up` on the host; after the next Stop or
