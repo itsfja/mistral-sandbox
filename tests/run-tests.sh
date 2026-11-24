@@ -191,6 +191,22 @@ check "  ...without touching the network or writing a .bak" bash -c "! grep -q '
 out="$(run "$S" update 2>&1)"; rc=$?
 check "update refuses in a git checkout, pointing at git pull" [ $rc -ne 0 ] && grep -q 'git -C .* pull' <<<"$out"
 
+echo "== provision.sh beside the real script, symlinked or not"
+fresh
+printf 'echo user-hook\n' > "$T/provision.sh"
+mkdir -p "$T/link"; ln -s "$S" "$T/link/vibe-sandbox.sh"
+printf 'echo wrong-hook\n' > "$T/link/provision.sh"
+out="$(run "$T/link/vibe-sandbox.sh" up 2>&1)"; rc=$?
+check "up via a symlink exits 0" [ $rc -eq 0 ]
+check "  ...runs provision.sh beside the real script" grep -q "running user provisioning hook $T/provision.sh" <<<"$out"
+check "  ...not the one beside the symlink" grep -q '^echo user-hook$' "$T/ct/1042/root/provision.sh"
+check "  ...hook shim execs the resolved script" grep -q "exec $S hook" "$T/snip/vibe-sandbox-hook.sh"
+run FORCE=1 RESCUE=0 "$T/link/vibe-sandbox.sh" down >/dev/null 2>&1
+mkdir -p "$T/locked"; touch "$T/locked/1042"; gui_hook 1042 pre-start >/dev/null; rm -f "$T/locked/1042"
+touch "$T/run/1042"; rm -f "$T/ct/1042/root/provision.sh"
+out="$(gui_hook 1042 post-start)"
+check "GUI post-start runs the same provision.sh" grep -q "running user provisioning hook $T/provision.sh" <<<"$out" && grep -q '^echo user-hook$' "$T/ct/1042/root/provision.sh"
+
 echo "== vscode-connect PVE_KEY default (#44)"
 D="$(dirname "$SRC")"
 check "vscode-connect.sh defaults to /root/.vibe-sandbox-ssh" grep -q 'PVE_KEY="${PVE_KEY:-/root/.vibe-sandbox-ssh}"' "$D/vscode-connect.sh"
