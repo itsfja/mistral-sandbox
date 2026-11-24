@@ -757,6 +757,14 @@ References:
   `ssh -i /root/.vibe-sandbox-ssh root@<ip>` (note the leading dot), or
   run `/root/vibe-sandbox.sh shell` on the host (`pct enter`, no
   password).
+- `ssh root@<ip>` fails at once with `Permission denied (publickey)` —
+  by design: password logins are switched off, and plain `ssh` does not
+  offer the sandbox key because `/root/.vibe-sandbox-ssh` is not one of
+  ssh's default key files. Use `/root/vibe-sandbox.sh ssh`, pass
+  `-i /root/.vibe-sandbox-ssh`, or add a `Host` entry with
+  `IdentityFile /root/.vibe-sandbox-ssh` to `/root/.ssh/config`. (Builds
+  from before this change still show a password prompt that can never
+  succeed.)
 - `ssh` says `Identity file ... not accessible` or the shell says
   `vibe-sandbox.sh: command not found` — the key lives at
   `/root/.vibe-sandbox-ssh` (leading dot) and the script is not on
@@ -1017,9 +1025,11 @@ sudo bash tests/run-tests.sh
 - The container is unprivileged with nesting enabled.
 - Root access to the sandbox is key-only, by construction: the template
   ships root's password locked, the script never sets one, and
-  provisioning pins `PermitRootLogin prohibit-password` — so the PVE
-  GUI console cannot log in and root SSH accepts only the managed
-  keypair (plus `pct enter` from the host).
+  provisioning pins `PermitRootLogin prohibit-password`,
+  `PasswordAuthentication no` and `KbdInteractiveAuthentication no` — so
+  the PVE GUI console cannot log in, sshd does not even offer a password
+  prompt, and SSH accepts only the managed keypair (plus `pct enter` from
+  the host).
 - Treat the sandbox like a CI job: least-privileged, revocable credentials
   only.
 - Clobber protects the stopped CT's disk only. For physical-theft threat
