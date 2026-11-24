@@ -10,9 +10,10 @@ outbound internet access — without handing it your machine.
 
 - **Single use** — one sandbox at a time (fixed CTID); nothing persists
   between uses.
-- **Auto rebuild on startup** — `up` (or a GUI Start) never resumes an old
-  container: it destroys any existing one and rebuilds from the template,
-  so every session starts clean.
+- **Auto rebuild on startup** — `up` never resumes an old container: it
+  destroys any existing one and rebuilds from the template, so every
+  session starts clean. A GUI Start boots the never-used stub that the
+  last Stop built (see [GUI-driven lifecycle](#gui-driven-lifecycle-proxmox-right-click)).
 - **Serially rebuildable** — a global `flock` serializes operations and the
   build is deterministic from the config block; rebuild #1 == rebuild #50.
 - **Internet-enabled** — unrestricted outbound net: the agent can download
@@ -35,9 +36,10 @@ outbound internet access — without handing it your machine.
   DHCP server for that MAC: the reservation then holds for every future
   rebuild. Override with `CT_MAC`.
 - **GUI-trapped** — the Proxmox GUI drives the lifecycle: right-click
-  Start = fresh rebuild + provisioning; Stop = disk clobber + parked stub;
-  Restart = fresh rebuild. Implemented with a `pct` hookscript, whose shim
-  is auto-deployed on every run. `HOOK=off` disables it.
+  Stop = disk clobber + a freshly built, never-booted stub; Start = boot
+  that stub + provisioning; Restart = both. Implemented with a `pct`
+  hookscript, whose shim is auto-deployed on every run. `HOOK=off`
+  disables it.
 - **Clobbered** — on stop, the rootfs is discarded (`CLOBBER=discard`,
   instant on SSD) or zero-filled (`CLOBBER=zero`, overwrite-grade) and the
   CT is replaced by a pristine, unprovisioned stopped stub: the GUI keeps
@@ -65,7 +67,8 @@ outbound internet access — without handing it your machine.
   drift; build paths (`up`, GUI Start) sha256-check against the copy on
   `main`, auto-install the current version (previous copy kept beside
   the script), and re-run once. `AUTO_UPDATE=off` disables; the `update`
-  subcommand does it on demand.
+  subcommand does it on demand. A copy inside a `git clone` is left to
+  `git pull`.
 - **Connector-hardened** — every rebuild injects a hardened
   `/root/.vibe/config.toml` (mode `400`) disabling Vibe connectors
   (`VIBE_CONNECTORS=off`), MCP servers (`VIBE_MCP=off`), and
@@ -75,7 +78,9 @@ outbound internet access — without handing it your machine.
   `firewall=1` and the host writes `/etc/pve/firewall/<CTID>.fw` outside
   container root control. Default `EGRESS_POLICY=lan-block` permits
   inbound SSH and outbound DHCP/DNS/internet while dropping outbound
-  RFC1918 LAN, link-local/metadata, CGNAT, and IPv6 ULA traffic;
+  RFC1918 LAN, link-local/metadata, CGNAT, and IPv6 ULA traffic, plus
+  any `EGRESS_DENY` ranges (set it to your site's public IPv6 prefix:
+  with native IPv6 your LAN devices also have public addresses);
   `EGRESS_POLICY=strict` drops all other outbound traffic except
   `EGRESS_ALLOW` destinations; `EGRESS_POLICY=off` disables it.
 
@@ -212,6 +217,8 @@ message above them and check Troubleshooting below.
 
 ```bash
 ssh -i /root/.vibe-sandbox-ssh root@$(/root/vibe-sandbox.sh ip)
+# or, the same thing without typing the key path:
+/root/vibe-sandbox.sh ssh
 ```
 
 The IP is the one `up` printed; `/root/vibe-sandbox.sh ip` shows it again
@@ -251,7 +258,8 @@ Other doors in and out:
 The disk is clobbered and the sandbox is parked as a fresh, stopped stub:
 nothing from your session is recoverable from it. Your API key store and
 SSH keypair stay on the host. The next session is either `up` again, or
-just right-click Start on the stub in the Proxmox GUI. To remove the CT
+just right-click Start on the stub in the Proxmox GUI (`status` says
+whether the stopped CT is a fresh stub that GUI Start will accept). To remove the CT
 from the tree entirely, use `purge` instead.
 
 ## From your desktop (export)
@@ -436,7 +444,7 @@ What a run does:
   again: only the `HostName` line ever changes between rebuilds.
 
 Overrides (env vars, defaults in the script headers): `PVE_SCRIPT`,
-`PVE_KEY`, `SSH_ALIAS`. The account at `PVE_HOST` must be able to read
+`PVE_KEY` (default `/root/.vibe-sandbox-ssh`, the managed key), `SSH_ALIAS`. The account at `PVE_HOST` must be able to read
 the managed sandbox key on the host (root by default). The extension
 side is pushable too: `remote.SSH.defaultExtensions` (desktop setup,
 step 4) makes every connect install `mistralai.mistral-vibe-code` into
@@ -480,19 +488,20 @@ the Proxmox GUI becomes the front end:
 
 ```mermaid
 flowchart TD
-    S["GUI: right-click Start"] --> PS1["pre-start hook:<br/>guard + destroy + recreate fresh"]
-    PS1 --> PVEB["PVE boots the NEW container"]
-    PVEB --> PS2["post-start hook:<br/>provision + inject credentials<br/>ssh line goes to the task log"]
-    T["GUI: right-click Stop / Shutdown"] --> PR2["post-stop hook:<br/>guard + clobber rootfs + park fresh stub"]
+    T["GUI: right-click Stop / Shutdown"] --> PR2["post-stop hook:<br/>guard + clobber rootfs + build fresh stub<br/>mark it pristine"]
     R["GUI: right-click Restart"] --> PR2
     PR2 --> S
+    S["GUI: right-click Start"] --> PS1{"pre-start hook:<br/>guard; is the CT a<br/>pristine stub?"}
+    PS1 -- yes --> PVEB["clear the mark;<br/>PVE boots the stub"]
+    PS1 -- no --> REF["Start refused:<br/>run vibe-sandbox.sh up"]
+    PVEB --> PS2["post-start hook:<br/>provision + inject credentials<br/>ssh line goes to the task log"]
 ```
 
 | GUI action | What actually happens |
 | --- | --- |
-| Start | fresh rebuild from template, then provisioning; the Start task stays busy until provisioning finishes — open its log for the `ssh -i ...` line |
-| Stop / Shutdown | rootfs clobbered (`CLOBBER`), CT replaced by a pristine stopped stub; the GUI keeps a Start-able object holding nothing from the session |
-| Restart | stop phases, then start phases: a fresh rebuild |
+| Start | boots the stub the last Stop (or `down`) built, then provisions it; the Start task stays busy until provisioning finishes — open its log for the `ssh -i ...` line. Refused, with a pointer to `up`, if the stopped CT has ever booted or the firewall settings changed since it was parked |
+| Stop / Shutdown | rootfs clobbered (`CLOBBER`), CT replaced by a freshly built, never-booted stub, recorded in `/root/.vibe-sandbox.pristine-stub` (`STUB_MARKER`); the GUI keeps a Start-able object holding nothing from the session |
+| Restart | stop phases, then start phases: a fresh stub, booted |
 | Snapshot / Clone / Migrate / Backup / Console | **not trappable** (no hook phase) — harmless, since the next Start purges everything, but they cannot be blocked per-CT |
 
 CLI and hooks coexist: a hook phase fires from *inside* the `pct` call
@@ -505,10 +514,18 @@ does the work. A hook phase therefore never aborts a CLI build with
 
 Honest caveats:
 
-- **Test on your PVE build first.** The pre-start hook recreates the CT
-  while PVE is mid-Start on the same vmid. It works because the recreated
-  config and disk volid are identical (same vmid, same storage), but it is
-  the piece most sensitive to PVE updates.
+- **Why the rebuild happens at Stop.** Proxmox holds the CT's config lock
+  (`/run/lock/lxc/pve-config-<CTID>.lock`) for the whole Start task,
+  hookscript `pre-start` and `post-start` included. Any `pct destroy`,
+  `create`, `set` or `push` from those phases waits on its own task and
+  times out. So pre-start only checks the stub and lets it boot, and
+  post-start provisions with `pct exec` alone (files are streamed in over
+  stdin, not `pct push`). Every in-CT command runs under
+  `env -i HOME=/root ...`: PVE runs hookscripts with an almost empty
+  environment, and `pct exec` passes the caller's environment into the
+  CT, so without it GUI and CLI builds would differ.
+- **A sandbox built before this change has no pristine-stub mark**, so
+  its first GUI Start is refused. Run `up` (or `down`) once on the host.
 - **Clobber levels.** `discard` is instant on SSDs and defeats casual and
   software-level recovery, but relies on the drive honoring TRIM — it is
   not guaranteed against chip-level forensics. `zero` is overwrite-grade
@@ -585,7 +602,7 @@ the container boots:
 
 | `EGRESS_POLICY` | Inbound | Outbound |
 | --- | --- | --- |
-| `lan-block` *(default)* | `DROP` except SSH (`TCP 22`) | Allows DHCP (`UDP 67–68`), DNS (`UDP/TCP 53`), explicit `EGRESS_ALLOW`, and general internet; **DROPs** outbound RFC1918 LAN (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local/metadata (`169.254.0.0/16`), CGNAT (`100.64.0.0/10`), and IPv6 ULA/link-local (`fc00::/7`, `fe80::/10`) |
+| `lan-block` *(default)* | `DROP` except SSH (`TCP 22`) | Allows DHCP (`UDP 67–68`), DNS (`UDP/TCP 53`), explicit `EGRESS_ALLOW`, and general internet; **DROPs** outbound RFC1918 LAN (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local/metadata (`169.254.0.0/16`), CGNAT (`100.64.0.0/10`), IPv6 ULA/link-local (`fc00::/7`, `fe80::/10`), and any `EGRESS_DENY` ranges |
 | `strict` | `DROP` except SSH (`TCP 22`) | `policy_out: DROP`; allows **only** DHCP, DNS, and explicit comma-separated CIDRs/IPs in `EGRESS_ALLOW` |
 | `off` | Unmanaged | Unmanaged (`firewall=1` omitted; managed `.fw` removed) |
 
@@ -600,7 +617,19 @@ EGRESS_ALLOW=192.168.3.50/32 /root/vibe-sandbox.sh up
 
 # Strict egress: drop all outbound except an explicit proxy or IP allowlist
 EGRESS_POLICY=strict EGRESS_ALLOW=192.168.3.10/32 /root/vibe-sandbox.sh up
+
+# Native IPv6: also block your site's public range (your ISP-delegated prefix)
+EGRESS_DENY=2001:db8:1234::/48 /root/vibe-sandbox.sh up
 ```
+
+**Native IPv6.** `lan-block`'s built-in ranges are all private. On a
+network with native IPv6 the sandbox gets a public SLAAC address and a
+default route, and every LAN device's own public IPv6 address stays
+reachable unless you list your site's prefix in `EGRESS_DENY`
+(comma-separated CIDRs, dropped after `EGRESS_ALLOW`, so a single
+allowed host inside the range still gets through). `up` and GUI Start
+warn when the sandbox has a public IPv6 address and `EGRESS_DENY` is
+empty, and suggest the /48 to use.
 
 **Proxmox Datacenter firewall prerequisite:** Proxmox ignores per-CT
 `.fw` rules unless the Datacenter firewall is enabled in
@@ -671,8 +700,23 @@ References:
   left WITHOUT credentials (`/root/.vibe/.env` never injected).
   Update the script and re-run `up` for a clean rebuild; the
   half-provisioned CT is destroyed first.
-- `clobber: blkdiscard failed` — your rootfs sits on rotational storage;
-  use `CLOBBER=zero` for overwrite-grade wiping.
+- `clobber: blkdiscard failed on <dev>: <reason>` — the reason is
+  blkdiscard's own (for example, the storage does not support discard).
+  Use `CLOBBER=zero` for overwrite-grade wiping. Before this was fixed,
+  every interactive `down` skipped the wipe: util-linux 2.36+ refuses to
+  discard a device holding a filesystem without `-f` when run from a
+  terminal, and the script hid that and blamed rotational storage.
+- `can't lock file '/run/lock/lxc/pve-config-<CTID>.lock' - got timeout`
+  on a GUI Start (`hookscript error ... on pre-start`) — a script from
+  before the GUI Start fix tried to rebuild the CT inside the Start task,
+  which holds that lock. Update the script, then run `up` once.
+- `pre-start: CT <id> is not a fresh stub` on a GUI Start — the stopped
+  CT has booted since it was built (or predates the pristine-stub mark).
+  Run `/root/vibe-sandbox.sh up` on the host; after the next Stop or
+  `down`, GUI Start works again.
+- `pre-start: firewall settings changed since CT <id> was parked` — the
+  stub's `firewall=1` flag no longer matches `FIREWALL`/`EGRESS_POLICY`,
+  and pre-start cannot edit the CT config under Proxmox's lock. Run `up`.
 - `refusing to touch CT <id>: it is not this script's sandbox` — the
   ownership guard fired: something that is not a tagged, sandbox-hostnamed
   CT sits at that ID. Move it or set `CTID` to a free ID; only if you are
@@ -799,11 +843,12 @@ References:
 | `down` | clobber the disk and park a fresh stopped stub (GUI Start-able) |
 | `purge` | destroy completely — no stub, gone from the tree |
 | `reset` | `down` then `up` — fresh rebuild mid-work |
-| `status` | is the sandbox up? CTID, state, IP |
+| `status` | is the sandbox up? CTID, state, IP; for a stopped CT, whether it is a fresh stub GUI Start will accept |
 | `ip` | print the current IP (empty if not running) |
 | `shell` | drop into a root shell inside the CT |
+| `ssh [cmd...]` | ssh into the CT with the managed key (no `-i` to type), optionally running `cmd` |
 | `export` | write a desktop bundle (keypair copy + ssh-config + per-OS instructions) to `EXPORT_DIR` |
-| `update` | self-update the script from `main` (previous copy kept beside it) |
+| `update` | self-update the script from `main` (previous copy kept beside it); refuses inside a `git clone`, where `git pull` is the update |
 | `hook` | internal — called by the PVE hookscript shim with (vmid, phase) |
 
 ## Self-update
@@ -830,6 +875,11 @@ and GUI Start — the pre-start hook; `status`, `ip`, `shell`, and
 - **Controls**: `AUTO_UPDATE=off` disables the automatic check
   entirely; `vibe-sandbox.sh update` performs the update explicitly
   (same backup and validation), regardless of `AUTO_UPDATE`.
+- **Git checkouts**: run from a `git clone` (a `.git` in the script's
+  directory or above), the script never self-updates: rewriting a
+  tracked file and leaving a `.bak` beside it would make the next
+  `git pull` conflict. Build paths say so and carry on; `update` points
+  you at `git pull`.
 
 Honest caveats:
 
@@ -882,7 +932,10 @@ injected Vibe config; default `off`), `VIBE_AUTO_APPROVE` (`off`/`on`:
 `/etc/pve/firewall/<CTID>.fw`; default `on`), `EGRESS_POLICY`
 (`lan-block`/`strict`/`off`: host-enforced outbound firewall policy;
 default `lan-block`), `EGRESS_ALLOW` (optional comma-separated IPv4/IPv6
-IPs or CIDRs allowed outbound), and `FW_DIR` (Proxmox firewall config
+IPs or CIDRs allowed outbound), `EGRESS_DENY` (optional comma-separated
+CIDRs that `lan-block` also drops; set it to your site's public IPv6
+prefix), `STUB_MARKER` (host file recording that the parked stub has
+never booted; default `/root/.vibe-sandbox.pristine-stub`), and `FW_DIR` (Proxmox firewall config
 directory; default `/etc/pve/firewall`).
 
 ## Hooks
@@ -890,7 +943,21 @@ directory; default `/etc/pve/firewall`).
 Place a `provision.sh` beside the script to run extra setup inside each
 fresh container after base provisioning (toolchains, repo clones). Keep it
 deterministic to keep rebuilds identical. (Unrelated to the PVE
-hookscript — this one is your per-use provisioning hook.)
+hookscript — this one is your per-use provisioning hook.) It runs as
+root under a clean environment (`HOME=/root`, `LANG=C.UTF-8`, a fixed
+`PATH`), the same for CLI `up` and GUI Start.
+
+## Tests
+
+`tests/run-tests.sh` dry-runs the script against mock Proxmox commands
+(`tests/mock/bin`): build, park, GUI Start under the Proxmox CT lock,
+the disk wipe, the firewall rules, and self-update in a git checkout.
+Run it as root on any Linux box with bash and `ssh-keygen`, **not** on
+the Proxmox host:
+
+```bash
+sudo bash tests/run-tests.sh
+```
 
 ## Auto-rebuild on host boot (optional)
 
