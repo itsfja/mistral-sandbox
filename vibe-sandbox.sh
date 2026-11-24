@@ -134,6 +134,7 @@
 #   shell     drop into a root shell inside the CT
 #   ssh       ssh into the CT with the managed key: ssh [command...]
 #   ip        print the current IP (empty if not running)
+#   version   print the script's release version
 #   export    bundle the keypair + ssh-config for desktop use (after 'up')
 #   update    self-update the script from main (previous copy kept as .bak;
 #             refuses inside a git checkout: use git pull there)
@@ -153,6 +154,10 @@
 # ============================================================================
 
 set -euo pipefail
+
+# Release version. Bumped only in a release PR, together with CHANGELOG.md;
+# the release workflow refuses a tag that does not match it.
+VIBE_SANDBOX_VERSION="1.0.0"
 
 # --------------------------- host config file --------------------------------
 # Settings that must hold for EVERY run go in $CONFIG_FILE (default
@@ -1466,6 +1471,7 @@ case "${1:-}" in
   reset)  shift; cmd_down; cmd_up ;;
   status) shift; cmd_status ;;
   ip)     sandbox_ip ;;
+  version|--version) echo "vibe-sandbox $VIBE_SANDBOX_VERSION" ;;
   shell)  shift; cmd_shell ;;
   ssh)    shift; cmd_ssh "$@" ;;
   export) shift; cmd_export ;;

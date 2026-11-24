@@ -24,6 +24,13 @@ jobs:
           done
           exit "$bad"
 
+      - name: CHANGELOG has an entry for VIBE_SANDBOX_VERSION
+        run: |
+          ver="$(sed -n 's/^VIBE_SANDBOX_VERSION="\(.*\)"$/\1/p' vibe-sandbox.sh)"
+          [ -n "$ver" ] || { echo "::error file=vibe-sandbox.sh::VIBE_SANDBOX_VERSION not found"; exit 1; }
+          grep -q "^## $ver - [0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$" CHANGELOG.md \
+            || { echo "::error file=CHANGELOG.md::no '## $ver - YYYY-MM-DD' entry for VIBE_SANDBOX_VERSION=$ver"; exit 1; }
+
       - name: Syntax check
         run: |
           bash -n vibe-sandbox.sh
