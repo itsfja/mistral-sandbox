@@ -879,6 +879,7 @@ References:
 | `reset` | `down` then `up` — fresh rebuild mid-work |
 | `status` | is the sandbox up? CTID, state, IP; for a stopped CT, whether it is a fresh stub GUI Start will accept |
 | `ip` | print the current IP (empty if not running) |
+| `version` | print the script's release version |
 | `shell` | drop into a root shell inside the CT |
 | `ssh [cmd...]` | ssh into the CT with the managed key (no `-i` to type), optionally running `cmd` |
 | `export` | write a desktop bundle (keypair copy + ssh-config + per-OS instructions) to `EXPORT_DIR` |
@@ -1022,6 +1023,74 @@ the Proxmox host:
 ```bash
 sudo bash tests/run-tests.sh
 ```
+
+## Releases
+
+`main` is where changes land; **releases are the tested versions** you
+run on the host. Each release is a git tag (`v1.0.0`) with a GitHub
+release and an entry in [CHANGELOG.md](CHANGELOG.md). `vibe-sandbox.sh
+version` prints the version you are running.
+
+### Run a release on the host
+
+```bash
+git clone https://github.com/itsfja/mistral-sandbox /root/mistral-sandbox
+git -C /root/mistral-sandbox checkout v1.0.0
+ln -sf /root/mistral-sandbox/vibe-sandbox.sh /root/vibe-sandbox.sh
+```
+
+Upgrade on purpose, one release at a time, after reading its changelog
+entry:
+
+```bash
+git -C /root/mistral-sandbox fetch --tags
+git -C /root/mistral-sandbox checkout v1.1.0
+/root/vibe-sandbox.sh version
+```
+
+A checkout of a tag never self-updates (it is a git checkout), so the
+host stays on the release you chose. If a release misbehaves, check out
+the previous tag.
+
+### Cutting a release
+
+1. **Release PR** from `main`: bump `VIBE_SANDBOX_VERSION` in
+   `vibe-sandbox.sh` and move the `Unreleased` entries in `CHANGELOG.md`
+   under the new version with today's date. CI must pass.
+2. **Test the merged `main` on the Proxmox host** with the checklist
+   below. The dry-run tests cannot catch Proxmox behaviour (the post-stop
+   lock bug in #52 passed them all), so this step is not optional.
+3. **Tag and push**: `git tag -a v1.0.0 -m v1.0.0 && git push origin v1.0.0`.
+   The `release` workflow checks that the tag matches
+   `VIBE_SANDBOX_VERSION` and has a changelog entry, runs the tests, and
+   publishes the GitHub release with that entry as its notes.
+
+Versioning: patch (`1.0.x`) for fixes, minor (`1.x.0`) for new features
+or settings, major for changes that need you to act (renamed settings,
+moved files).
+
+### Release checklist (on the Proxmox host)
+
+Run from the release candidate (`git checkout main && git pull`), with
+your real `/root/.vibe-sandbox.conf`. Every box must be ticked before
+tagging.
+
+- [ ] `vibe-sandbox.sh version` prints the new version
+- [ ] `vibe-sandbox.sh up` ends with `sandbox ready.`, no warnings you
+      did not expect
+- [ ] `ssh vibe` (or `vibe-sandbox.sh ssh`) logs in;
+      `ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new root@<ip> true`
+      says `Permission denied (publickey)`
+- [ ] from the sandbox, LAN and site IPv6 are blocked:
+      `vibe-sandbox.sh ssh 'curl -m5 -sk https://192.168.3.1 >/dev/null; echo rc=$?'`
+      and the same with `-6` to an IPv6 host on your LAN both print `rc=28`;
+      `grep EGRESS_DENY /etc/pve/firewall/<CTID>.fw` matches
+- [ ] `vibe-sandbox.sh down`, then `status` says `fresh stub`
+- [ ] GUI **Start**: the task log ends with `sandbox ready via GUI.`
+- [ ] GUI **Stop**: `journalctl -u vibe-sandbox-park-<CTID>` ends with
+      `ready for GUI Start`; `status` says `fresh stub`
+- [ ] GUI **Start** again succeeds, and `grep EGRESS_DENY` still matches
+- [ ] `vibe` starts inside the sandbox and answers one prompt
 
 ## Auto-rebuild on host boot (optional)
 

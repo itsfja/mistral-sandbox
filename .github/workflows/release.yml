@@ -1,0 +1,45 @@
+name: release
+
+# Push a tag vX.Y.Z (after the release checklist in README.md#releases has
+# passed on the Proxmox host) to publish the GitHub release.
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches VIBE_SANDBOX_VERSION
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(sed -n 's/^VIBE_SANDBOX_VERSION="\(.*\)"$/\1/p' vibe-sandbox.sh)"
+          echo "tag=$tag script=$ver"
+          [ -n "$ver" ] && [ "$tag" = "$ver" ] || { echo "::error::tag v$tag does not match VIBE_SANDBOX_VERSION=$ver"; exit 1; }
+
+      - name: Extract the changelog entry
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          awk -v v="$ver" '
+            $0 ~ "^## " v " " { on = 1; next }
+            on && /^## /      { exit }
+            on                { print }
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || { echo "::error::no '## $ver - <date>' entry in CHANGELOG.md"; exit 1; }
+          cat notes.md
+
+      - name: Tests
+        run: |
+          bash -n vibe-sandbox.sh
+          shellcheck -S warning vibe-sandbox.sh vscode-connect.sh tests/run-tests.sh tests/mock/bin/*
+          sudo bash tests/run-tests.sh
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag

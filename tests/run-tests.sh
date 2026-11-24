@@ -258,6 +258,13 @@ touch "$T/run/1042"; rm -f "$T/ct/1042/root/provision.sh"
 out="$(gui_hook 1042 post-start)"
 check "GUI post-start runs the same provision.sh" grep -q "running user provisioning hook $T/provision.sh" <<<"$out" && grep -q '^echo user-hook$' "$T/ct/1042/root/provision.sh"
 
+echo "== version"
+fresh
+V="$(sed -n 's/^VIBE_SANDBOX_VERSION="\(.*\)"$/\1/p' "$S")"
+check "VIBE_SANDBOX_VERSION is semver" grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' <<<"$V"
+check "version subcommand prints it" [ "$(run "$S" version 2>&1)" = "vibe-sandbox $V" ]
+check "  ...and --version too" [ "$(run "$S" --version 2>&1)" = "vibe-sandbox $V" ]
+
 echo "== vscode-connect PVE_KEY default (#44)"
 D="$(dirname "$SRC")"
 check "vscode-connect.sh defaults to /root/.vibe-sandbox-ssh" grep -q 'PVE_KEY="${PVE_KEY:-/root/.vibe-sandbox-ssh}"' "$D/vscode-connect.sh"
