@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# Dry-run tests for vibe-sandbox.sh against mock Proxmox commands
+# (tests/mock/bin: pct, pvesm, blkdiscard, ssh). Covers the GUI Start lock
+# fix (#41), the blkdiscard wipe (#42), EGRESS_DENY / public IPv6 (#43)
+# and the tidy-ups in #45.
+# Needs root (/run/lock), bash, ssh-keygen. Never run on a Proxmox host.
+# Usage: sudo bash tests/run-tests.sh [path/to/vibe-sandbox.sh]
+set -uo pipefail
+[ ! -d /etc/pve ] || { echo "refusing to run on a Proxmox host: the tests clear /run/lock/vibe-sandbox.* (live locks)" >&2; exit 2; }
+SRC="$(readlink -f "${1:-$(dirname "$0")/../vibe-sandbox.sh}")"
+HERE="$(cd "$(dirname "$0")" && pwd)/mock"
+pass=0; fail=0
+ok()   { echo "  PASS $*"; pass=$((pass+1)); }
+bad()  { echo "  FAIL $*"; fail=$((fail+1)); }
+check() { local d="$1"; shift; if "$@"; then ok "$d"; else bad "$d"; fi; }
+
+fresh() {   # new isolated world; sets T and S (script copy outside any git checkout)
+  T="$(mktemp -d)"; export MOCK_T="$T"
+  mkdir -p "$T/host" "$T/fw" "$T/snip" "$T/home/.ssh"
+  S="$T/vibe-sandbox.sh"; cp "$SRC" "$S"; chmod +x "$S"
+  rm -f /run/lock/vibe-sandbox.*
+}
+# Host-side paths, redirected into the test world. A PVE hookscript gets
+# none of the caller's environment, so gui_hook passes them explicitly
+# (on a real host they are the script defaults).
+HOSTVARS='SSH_KEY_FILE=$T/host/ssh MAC_FILE=$T/host/mac SECRETS_FILE=$T/host/secrets.env STUB_MARKER=$T/host/pristine-stub FW_DIR=$T/fw HOOK_SNIPPET_DIR=$T/snip AUTO_UPDATE=off TEMPLATE=local:vztmpl/debian-12.tar.zst'
+run() {   # run the script copy in the mock world, with the caller's env
+  eval "env PATH=\"$HERE/bin:\$PATH\" HOME=\"\$T/home\" $HOSTVARS EXPORT_DIR=\"\$T/export\" \"\$@\""
+}
+gui_hook() {   # $1 = vmid, $2 = phase, $3 = extra VAR=val; env-less like PVE
+  env -i PATH="$HERE/bin:/usr/bin:/bin" MOCK_T="$T" \
+    bash -c "$(eval echo "$HOSTVARS") ${3:-} $S hook $1 $2" 2>&1
+}
+calls_lack() { ! grep -qE "$1" "$T/calls.log"; }
+
+echo "== up"
+fresh
+out="$(run "$S" up 2>&1)"; rc=$?
+check "up exits 0" [ $rc -eq 0 ]
+[ $rc -eq 0 ] || echo "$out" | tail -15
+check "CT 1042 created, tagged, hooked, firewall=1" grep -q '^tags: vibe-sandbox$' "$T/conf/1042.conf" && grep -q '^hookscript: ' "$T/conf/1042.conf" && grep -q 'firewall=1' "$T/conf/1042.conf"
+check "no pristine-stub marker after up" [ ! -e "$T/host/pristine-stub" ]
+check "provisioning without pct push" calls_lack '^pct push '
+check "provisioning in a clean env with HOME=/root" grep -qE '^pct exec 1042 -- env -i HOME=/root .*PATH=/root/.local/bin:[^ ]* bash /root/provision-base.sh$' "$T/calls.log"
+check "provision script pushed, mode 700" [ "$(stat -c %a "$T/ct/1042/root/provision-base.sh")" = 700 ]
+check "  ...disables dpkg progress lines" grep -q 'Dpkg::Use-Pty=0' "$T/ct/1042/root/provision-base.sh"
+check "  ...is valid bash" bash -n "$T/ct/1042/root/provision-base.sh"
+C="$T/ct/1042/root/.vibe/config.toml"
+check "vibe config injected, mode 400, all default-deny" [ "$(stat -c %a "$C")" = 400 ] && [ "$(grep -c '= false$' "$C")" = 3 ]
+check "missing key store -> wizard warning" grep -q 'no key store at' <<<"$out"
+check "ready line offers the ssh shortcut" grep -q "or on this host: $S ssh" <<<"$out"
+
+echo "== credentials"
+fresh
+printf 'MISTRAL_API_KEY=test-not-real\n' > "$T/host/secrets.env"; chmod 644 "$T/host/secrets.env"
+run "$S" up >/dev/null 2>&1
+check "key pushed to /root/.vibe/.env" grep -q 'MISTRAL_API_KEY=test-not-real' "$T/ct/1042/root/.vibe/.env"
+check "  ...mode 600 in CT" [ "$(stat -c %a "$T/ct/1042/root/.vibe/.env")" = 600 ]
+check "  ...host file tightened to 600" [ "$(stat -c %a "$T/host/secrets.env")" = 600 ]
+
+echo "== down: blkdiscard -f + pristine stub (#42, #41)"
+fresh
+run "$S" up >/dev/null 2>&1
+out="$(run FORCE=1 RESCUE=0 "$S" down 2>&1)"; rc=$?
+check "down exits 0" [ $rc -eq 0 ]
+check "  ...clobbered via blkdiscard -f" grep -q '^blkdiscard -f /dev/mock/' "$T/calls.log"
+check "  ...with no clobber failure" bash -c "! grep -q 'blkdiscard failed' <<<\"\$1\"" _ "$out"
+check "  ...stub exists, stopped, hook attached" [ -f "$T/conf/1042.conf" ] && [ ! -e "$T/run/1042" ] && grep -q hookscript "$T/conf/1042.conf"
+check "  ...pristine-stub marker written for CT 1042" [ "$(cat "$T/host/pristine-stub" 2>/dev/null)" = 1042 ]
+out="$(run "$S" status 2>&1)"
+check "status reports a fresh stub" grep -q 'stopped: fresh stub, ready for GUI Start' <<<"$out"
+# a failing discard reports blkdiscard's own reason, not a guess
+out="$(run FORCE=1 RESCUE=0 PATH="$T/nodiscard:$HERE/bin:$PATH" bash -c 'mkdir -p "$1"; printf "#!/bin/sh\necho \"blkdiscard: BLKDISCARD ioctl failed: Operation not supported\" >&2; exit 1\n" > "$1/blkdiscard"; chmod +x "$1/blkdiscard"; "$2" down' _ "$T/nodiscard" "$S" 2>&1)"
+check "failed discard reports blkdiscard's message" grep -q 'blkdiscard failed on /dev/mock/.*: blkdiscard: BLKDISCARD ioctl failed' <<<"$out"
+check "  ...and no longer guesses 'rotational disk'" bash -c "! grep -q 'rotational' <<<\"\$1\"" _ "$out"
+
+echo "== GUI Start under the Proxmox CT lock (#41)"
+fresh
+run "$S" up >/dev/null 2>&1
+run FORCE=1 RESCUE=0 "$S" down >/dev/null 2>&1
+mkdir -p "$T/locked"; touch "$T/locked/1042"; : > "$T/calls.log"
+out="$(gui_hook 1042 pre-start)"; rc=$?
+check "pre-start on a fresh stub succeeds under the lock" [ $rc -eq 0 ]
+[ $rc -eq 0 ] || echo "$out" | tail -5
+check "  ...without destroy/create/set/push" calls_lack '^pct (destroy|create|set|push) '
+check "  ...says it is starting the stub" grep -q 'fresh, never-booted stub' <<<"$out"
+check "  ...and consumes the marker" [ ! -e "$T/host/pristine-stub" ]
+touch "$T/run/1042"; : > "$T/calls.log"
+out="$(gui_hook 1042 post-start)"; rc=$?
+check "post-start under the lock provisions + reports" [ $rc -eq 0 ] && grep -q 'sandbox ready via GUI' <<<"$out"
+[ $rc -eq 0 ] || echo "$out" | tail -5
+check "  ...without pct push" calls_lack '^pct push '
+check "  ...provisioning has HOME=/root although the hook env is empty" grep -qE '^pct exec 1042 -- env -i HOME=/root .* bash /root/provision-base.sh$' "$T/calls.log"
+check "  ...config + provision script in place" [ -f "$T/ct/1042/root/provision-base.sh" ] && [ -f "$T/ct/1042/root/.vibe/config.toml" ]
+check "  ...hook output is ASCII-only (PVE task log mangles UTF-8)" bash -c "! LC_ALL=C grep -q '[^ -~]' <<<\"\$1\"" _ "$out"
+check "  ...warnings land in order on stdout" bash -c "[ \$(grep -n 'Datacenter firewall is disabled' <<<\"\$1\" | cut -d: -f1) -lt \$(grep -n 'ready via GUI' <<<\"\$1\" | cut -d: -f1) ]" _ "$out"
+rm -f "$T/run/1042"; : > "$T/calls.log"
+out="$(gui_hook 1042 pre-start)"; rc=$?
+check "pre-start refuses a CT that has booted" [ $rc -ne 0 ] && grep -q "is not a fresh stub.*run: $S up" <<<"$out"
+check "  ...without touching the CT" calls_lack '^pct (destroy|create|set) '
+rm -f "$T/locked/1042"
+out="$(run "$S" status 2>&1)"
+check "status flags the used stopped CT" grep -q 'NOT a fresh stub' <<<"$out"
+run FORCE=1 RESCUE=0 "$S" down >/dev/null 2>&1
+touch "$T/locked/1042"
+out="$(gui_hook 1042 pre-start FIREWALL=off)"; rc=$?
+check "pre-start refuses when firewall settings changed since park" [ $rc -ne 0 ] && grep -q 'firewall settings changed' <<<"$out"
+check "  ...and keeps the stub pristine" [ -e "$T/host/pristine-stub" ]
+out="$(gui_hook 1042 pre-start)"; rc=$?
+check "  ...then starts with the original settings" [ $rc -eq 0 ]
+rm -f "$T/locked/1042"
+# GUI Stop: PVE has stopped the CT; post-stop parks a new stub
+out="$(gui_hook 1042 post-stop FORCE=1)"; rc=$?
+check "post-stop parks a fresh stub again" [ $rc -eq 0 ] && [ "$(cat "$T/host/pristine-stub" 2>/dev/null)" = 1042 ]
+check "hook ignores other CTs" bash -c "[ -z \"\$1\" ]" _ "$(gui_hook 999 pre-start)"
+
+echo "== ownership guard"
+fresh
+mkdir -p "$T/conf"; printf 'hostname: wordpress\ntags: web\n' > "$T/conf/1042.conf"
+echo 1042 > "$T/host/pristine-stub"
+out="$(gui_hook 1042 pre-start)"; rc=$?
+check "pre-start refuses a foreign CT even with a marker" [ $rc -ne 0 ] && grep -q 'refusing to touch CT 1042' <<<"$out"
+
+echo "== IPv6: EGRESS_DENY and the public-IPv6 warning (#43)"
+fresh
+V6="2a10:d585:7f66:2:56:1dff:fef2:f487 2a10:d585:7f66:0:56:1dff:fef2:f487"
+out="$(run "$S" up 2>&1)"
+check "no IPv6 -> no warning" bash -c "! grep -q 'public IPv6' <<<\"\$1\"" _ "$out"
+out="$(run MOCK_IPV6="$V6" FORCE=1 RESCUE=0 "$S" up 2>&1)"
+check "public IPv6 + lan-block + no EGRESS_DENY -> warning" grep -q 'the sandbox has public IPv6 address' <<<"$out"
+check "  ...lists the addresses" grep -q '2a10:d585:7f66:0:56:1dff:fef2:f487/64' <<<"$out"
+check "  ...and suggests the /48" grep -q 'EGRESS_DENY=2a10:d585:7f66::/48' <<<"$out"
+out="$(run MOCK_IPV6="$V6" EGRESS_DENY=2a10:d585:7f66::/48 FORCE=1 RESCUE=0 "$S" up 2>&1)"
+check "EGRESS_DENY set -> no warning" bash -c "! grep -q 'public IPv6' <<<\"\$1\"" _ "$out"
+check "  ...and the .fw drops the site range" grep -q '^OUT DROP -dest 2a10:d585:7f66::/48 -log nolog # EGRESS_DENY' "$T/fw/1042.fw"
+check "  ...before the private-range drops" bash -c "[ \$(grep -n 'EGRESS_DENY' '$T/fw/1042.fw' | cut -d: -f1) -lt \$(grep -n '10.0.0.0/8' '$T/fw/1042.fw' | cut -d: -f1) ]"
+run EGRESS_DENY=2a10:d585:7f66::/48 EGRESS_ALLOW=2a10:d585:7f66:2::50/128 FORCE=1 RESCUE=0 "$S" up >/dev/null 2>&1
+check "EGRESS_ALLOW still punches a hole first" bash -c "[ \$(grep -n 'EGRESS_ALLOW' '$T/fw/1042.fw' | cut -d: -f1) -lt \$(grep -n 'EGRESS_DENY' '$T/fw/1042.fw' | cut -d: -f1) ]"
+out="$(run EGRESS_DENY='2a10::/48;DROP' FORCE=1 RESCUE=0 "$S" up 2>&1)"; rc=$?
+check "invalid EGRESS_DENY rejected (no .fw injection)" [ $rc -ne 0 ] && grep -q "invalid IP/CIDR '2a10::/48;DROP' in EGRESS_DENY" <<<"$out"
+out="$(run MOCK_IPV6="$V6" EGRESS_POLICY=strict FORCE=1 RESCUE=0 "$S" up 2>&1)"
+check "strict policy -> no IPv6 warning" bash -c "! grep -q 'public IPv6' <<<\"\$1\"" _ "$out"
+
+echo "== ssh, self-update in a git checkout (#45)"
+fresh
+out="$(run "$S" ssh 2>&1)"
+check "ssh refuses when the sandbox is not running" grep -q 'sandbox not running' <<<"$out"
+run "$S" up >/dev/null 2>&1; : > "$T/calls.log"
+run "$S" ssh uname -a >/dev/null 2>&1
+check "ssh uses the managed key, accept-new, and passes the command" grep -qx "ssh -i $T/host/ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new root@192.168.3.77 uname -a" "$T/calls.log"
+out="$(run AUTO_UPDATE=on RAW_URL=http://127.0.0.1:9/none FORCE=1 RESCUE=0 "$S" up 2>&1)"
+check "self-check outside a checkout tries RAW_URL" grep -q 'self-check: could not fetch' <<<"$out"
+mkdir "$T/.git"
+out="$(run AUTO_UPDATE=on RAW_URL=http://127.0.0.1:9/none FORCE=1 RESCUE=0 "$S" up 2>&1)"
+check "self-check inside a git checkout is skipped" grep -q "self-check: skipped - running from the git checkout at $T" <<<"$out"
+check "  ...without touching the network or writing a .bak" bash -c "! grep -q 'could not fetch' <<<\"\$1\" && [ ! -e '$S.bak' ]" _ "$out"
+out="$(run "$S" update 2>&1)"; rc=$?
+check "update refuses in a git checkout, pointing at git pull" [ $rc -ne 0 ] && grep -q 'git -C .* pull' <<<"$out"
+
+echo "== vscode-connect PVE_KEY default (#44)"
+D="$(dirname "$SRC")"
+check "vscode-connect.sh defaults to /root/.vibe-sandbox-ssh" grep -q 'PVE_KEY="${PVE_KEY:-/root/.vibe-sandbox-ssh}"' "$D/vscode-connect.sh"
+check "vscode-connect.ps1 defaults to /root/.vibe-sandbox-ssh" grep -q "'/root/.vibe-sandbox-ssh'" "$D/vscode-connect.ps1"
+
+echo
+echo "passed: $pass  failed: $fail"
+[ "$fail" -eq 0 ]

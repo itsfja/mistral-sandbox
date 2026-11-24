@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Mock blkdiscard: like util-linux >= 2.36 run from a terminal, refuse a
+# device holding a filesystem signature (a rootfs always does) without -f.
+echo "blkdiscard $*" >> "$MOCK_T/calls.log"
+case " $* " in
+  *" -f "*|*" --force "*) exit 0 ;;
+esac
+echo "blkdiscard: ${!#} contains existing file system (ext4)." >&2
+echo "blkdiscard: This is destructive operation, data will be lost! Use the -f option to override." >&2
+exit 1

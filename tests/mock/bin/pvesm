@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Mock of Proxmox `pvesm`: `pvesm path <volid>` -> a fake block device.
+echo "pvesm $*" >> "${MOCK_T:?}/calls.log"
+case "$1" in
+  path) echo "/dev/mock/${2//[:\/]/-}" ;;
+  *) echo "mock pvesm: unhandled $1" >&2; exit 3 ;;
+esac
