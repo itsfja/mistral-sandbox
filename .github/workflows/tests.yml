@@ -1,0 +1,28 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: |
+          bash -n vibe-sandbox.sh
+          bash -n vscode-connect.sh
+          bash -n tests/run-tests.sh
+
+      - name: ShellCheck
+        run: shellcheck -S warning vibe-sandbox.sh vscode-connect.sh tests/run-tests.sh tests/mock/bin/*
+
+      - name: Dry-run tests (mock Proxmox)
+        # needs root for /run/lock; refuses to run where /etc/pve exists
+        run: sudo bash tests/run-tests.sh
